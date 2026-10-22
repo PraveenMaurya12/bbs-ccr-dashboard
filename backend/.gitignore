@@ -1,0 +1,42 @@
+# Dependencies
+node_modules
+
+# Build output
+dist
+
+# Env
+.env
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# Testing
+coverage
+
+# Locally-stored uploaded documents (see LocalDiskStorageProvider) — never
+# real customer files in this dev environment, but never committed either.
+storage/
+
+# Raw Experian SOAP responses captured by the dev-only, opt-in test (see
+# modules/bureau/experian-response-capture.dev-only.spec.ts) — never
+# committed, since a real response may contain genuine bureau data.
+# Also covers local-only QA DB backups (tmp/qa-backup/).
+tmp/
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea
+
+# OS
+.DS_Store
+
+# Local dev auth token for manual API calls — never committed.
+.ccr-token
+
+# Ad hoc debug-analysis dumps captured against a real lead during manual
+# testing — may contain genuine bureau/financial data, never committed.
+da.json
+*.debug-dump.json

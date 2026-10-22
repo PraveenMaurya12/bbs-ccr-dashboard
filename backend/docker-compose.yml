@@ -1,0 +1,27 @@
+name: bbs-ccr-dashboard
+
+services:
+  postgres:
+    image: postgres:17.5-alpine
+    container_name: bbs-ccr-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-bbs_ccr_dashboard}
+      POSTGRES_USER: ${POSTGRES_USER:-bbs_ccr_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in backend/.env}
+    # Bind only to localhost — never expose Postgres on the network.
+    ports:
+      - '127.0.0.1:${POSTGRES_PORT:-15432}:5432'
+    volumes:
+      - bbs_ccr_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-bbs_ccr_app} -d ${POSTGRES_DB:-bbs_ccr_dashboard}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  # Named volume — data survives `docker compose down` / restarts.
+  # Only removed by an explicit `docker compose down -v`.
+  bbs_ccr_postgres_data:
