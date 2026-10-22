@@ -1,0 +1,40 @@
+import type { RecoveryPlan } from '@/types'
+
+export const mockRecoveryPlans: RecoveryPlan[] = [
+  {
+    id: 'rp-001',
+    leadId: 'BBS-LD-100231',
+    cohortDecisionId: 'cd-001',
+    planType: 'standard_emi',
+    principalAmount: 180000,
+    tenureMonths: 18,
+    interestRatePercent: 14.5,
+    monthlyInstallmentAmount: 11250,
+    ownerCcrId: 'ccr-01',
+    ownerCcrName: 'Vikram Shah',
+    status: 'in_progress',
+    createdAt: '2026-08-16T10:00:00.000Z',
+    updatedAt: '2026-09-20T11:40:00.000Z',
+    installments: [
+      { installmentNumber: 1, dueDate: '2026-09-15', amount: 11250, status: 'paid' },
+      { installmentNumber: 2, dueDate: '2026-10-15', amount: 11250, status: 'upcoming' },
+      { installmentNumber: 3, dueDate: '2026-11-15', amount: 11250, status: 'upcoming' },
+    ],
+  },
+  {
+    id: 'rp-002',
+    leadId: 'BBS-LD-100236',
+    cohortDecisionId: 'cd-002',
+    planType: 'restructured_emi',
+    principalAmount: 40000,
+    tenureMonths: 12,
+    interestRatePercent: 18,
+    monthlyInstallmentAmount: 3800,
+    ownerCcrId: 'ccr-03',
+    ownerCcrName: 'Priya Nair',
+    status: 'failed',
+    createdAt: '2026-09-03T09:00:00.000Z',
+    updatedAt: '2026-09-05T14:30:00.000Z',
+    installments: [],
+  },
+]
