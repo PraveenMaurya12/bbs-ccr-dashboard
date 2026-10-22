@@ -1,0 +1,2198 @@
+// BBS CCR Dashboard — database schema.
+//
+// Every model below documents its purpose inline. A few cross-cutting rules
+// this schema enforces:
+//  - Every lead-journey record hangs off `Lead.id`, and `Lead.bbsLeadId` is
+//    the stable, human-facing identifier used everywhere outside the DB.
+//  - Nothing stores a raw PAN. `Customer.panRef` is an opaque reference into
+//    a separate protected store (e.g. a vault/KMS-backed table or secret
+//    manager), never the PAN itself, and it is never the primary key.
+//  - Raw documents (bureau PDFs, bank statements) are never stored in the
+//    database or a public bucket. `DocumentMetadata` only holds a private
+//    storage reference (e.g. an S3 key behind a signed-URL service) plus
+//    metadata, and every read is recorded in `DocumentAccessLog`.
+//  - Assessments are append-only by convention: a new `FinancialAssessment`
+//    or `CustomerProfile` row is inserted with an incremented `version`
+//    rather than overwriting a prior (possibly CCR-verified) row.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// --- Enums -------------------------------------------------------------
+
+/// Role-based access control. CCR = frontline agent, SUPERVISOR = reviews
+/// and overrides CCR work, ADMIN = user/account management.
+enum Role {
+  CCR
+  SUPERVISOR
+  ADMIN
+}
+
+enum LeadSource {
+  WALK_IN
+  CALL_CENTER
+  ONLINE
+  REFERRAL
+  PARTNER_DEALER
+}
+
+/// Shared lifecycle status vocabulary reused by every pipeline stage
+/// (lead submission, bureau processing, L1/L2/L3, recovery plan) so the
+/// frontend's per-stage status model maps 1:1 onto the DB.
+enum StageStatus {
+  NOT_STARTED
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+  REQUIRES_REVIEW
+}
+
+enum AnalysisJobStatus {
+  QUEUED
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+/// Provider-independent label — which AI backend (if any) produced an
+/// AnalysisJob's result. "mock" is used until a real provider is wired up.
+enum AiProvider {
+  MOCK
+  OPENAI
+  GEMINI
+  CLAUDE
+  DEEPSEEK
+}
+
+/// The bureau-report pipeline's own status — distinct from the shared
+/// `StageStatus` (used by `Lead.bureauReportStatus` for the coarser
+/// journey-tracker stepper).
+///
+/// CRITICAL BUSINESS RULE: at most ONE Experian call is ever made per BBS
+/// lead (see CreditReport.leadId's @unique constraint, which is what
+/// actually enforces this at the database level — this enum only reports
+/// the outcome of that one call, it never gates whether a second one can
+/// happen). Each real Experian call costs the business money, so the call
+/// is reserved (a row inserted with IN_PROGRESS) atomically BEFORE the
+/// SOAP request is sent, and every possible outcome of that one call —
+/// including a hard failure or an unmapped response — is terminal. None of
+/// them may ever trigger a second live call for the same lead.
+///
+/// IN_PROGRESS: the one call has been reserved and is in flight.
+/// COMPLETED: a real bureau record was found and fully mapped.
+/// NO_RECORD: a legitimate, verified terminal result — Experian
+/// affirmatively found no bureau record for this identity
+/// (SCORE.BureauScore = -1, Match_result.Exact_match = "N") — not an
+/// error, and never retried "to try again".
+/// FAILED: the call itself did not complete (transport error, timeout,
+/// SOAP fault, or a response that could not even be parsed as XML) — no
+/// raw response exists to reprocess.
+/// REQUIRES_REVIEW: the call succeeded and returned a real, parseable
+/// response, but it doesn't match the one verified mapping this
+/// integration implements — the raw response IS stored (see
+/// CreditReport.rawResponse) so a developer can fix the mapper and
+/// reprocess it later without ever calling Experian again.
+enum BureauProcessingStatus {
+  IN_PROGRESS
+  COMPLETED
+  NO_RECORD
+  FAILED
+  REQUIRES_REVIEW
+}
+
+/// The bank-statement financial-analysis pipeline's own status — the BBS
+/// Financial Analysis Module spec's own exact lifecycle. Deliberately its
+/// own enum (not the shared `StageStatus`): no other pipeline in this
+/// schema has these exact named sub-stages, and the frontend's processing
+/// stepper renders each one individually rather than treating the whole
+/// pipeline as one opaque "in progress" wait.
+enum FinancialAnalysisStatus {
+  UPLOADED
+  EXTRACTING
+  NORMALIZING
+  CLASSIFYING
+  ANALYZING
+  COMPLETED
+  FAILED
+}
+
+enum BankStatementFileFormat {
+  PDF
+  XLSX
+  CSV
+}
+
+enum TransactionDirection {
+  CREDIT
+  DEBIT
+}
+
+/// The spec's exact 6 top-level categories + UNCLASSIFIED (used when
+/// evidence is insufficient — never force-assigned). `subcategory` on
+/// NormalizedTransaction is deliberately a free-text string validated at
+/// the application layer against the spec's own per-category list, not a
+/// second enum here — same "documented vocabulary, not an enum" convention
+/// CreditAccount.accountType/lifecycleStatus already use, so the
+/// subcategory list can grow without a migration.
+enum TransactionCategory {
+  INCOME
+  BORROWING
+  EXPENSE
+  TRANSFERS
+  CASH
+  OTHER
+  UNCLASSIFIED
+}
+
+/// The spec's evidence model: CONFIRMED = directly supported by the raw
+/// transaction/report data. DERIVED = calculated/synthesized from confirmed
+/// data. INFERRED = pattern-based, explicitly not yet validated — never
+/// presented as a confirmed fact. Every PDF-derived transaction (see
+/// pdf-statement-parser.ts) is capped at INFERRED regardless of how clean
+/// the heuristic match looks, per the confirmed v1 PDF-parsing scope.
+enum EvidenceLevel {
+  CONFIRMED
+  DERIVED
+  INFERRED
+}
+
+/// The spec's strict 3-tier bounce evidence (Rule 13/"Bounce / Return
+/// Analysis"). A fee-only narration ("ECS CHARGES" etc.) may NEVER be
+/// promoted to CONFIRMED_BOUNCE no matter how suggestive — this is an
+/// explicit non-negotiable rule (D06). Null on a transaction means "bounce
+/// evidence not evaluated / not relevant to this row" — distinct from
+/// UNKNOWN, which IS an evaluated-but-inconclusive outcome.
+enum BounceEvidenceTier {
+  CONFIRMED_BOUNCE
+  POSSIBLE_BOUNCE
+  UNKNOWN
+}
+
+/// The separate 0-100 "BBS Financial Stress Indicator" band — kept
+/// structurally distinct from FinancialHealthScore's own 5-point
+/// "Financial Stress Signals" score component, per the spec's explicit
+/// instruction not to combine the Health Score and the Stress Indicator
+/// into one number.
+enum FinancialStressBand {
+  LOW
+  MODERATE
+  ELEVATED
+  HIGH
+  CRITICAL
+}
+
+/// The spec's exact 5-tier risk-flag severity scale — deliberately
+/// different from BureauProcessingStatus/RiskFlag's existing
+/// High/Medium/Low (Debt Analysis) scale, since this module's own findings
+/// include positive/neutral observations, not only risk signals.
+enum FinancialFlagSeverity {
+  POSITIVE
+  INFORMATIONAL
+  ATTENTION
+  ELEVATED
+  CRITICAL
+}
+
+/// Master Profile's own pipeline status — a bespoke enum (not the shared
+/// StageStatus), following the BureauProcessingStatus/FinancialAnalysisStatus
+/// convention: this pipeline's own named lifecycle, not the coarser
+/// journey-tracker stepper.
+enum MasterProfileStatus {
+  GENERATING
+  COMPLETED
+  FAILED
+}
+
+/// BBS Master Profile Module v3.0 §12.1's exact 5-state Credit <-> Financial
+/// alignment classification — a descriptive profile state, never a score or
+/// ranking (the spec's own explicit instruction not to turn these into an
+/// overall score). v3.0 §12.1 explicitly removed the prior version's
+/// HIGH_DEBT_CAPACITY_ALIGNED and DATA_CONFLICT_VALIDATION_REQUIRED states —
+/// "these are now flags or handled via readiness gate" — and renamed the
+/// remaining three. COMPLIANCE_HOLD is new: per §12.3, it supersedes every
+/// other state whenever a related-party/legal compliance flag is active.
+enum CreditFinancialAlignmentState {
+  ALIGNED_HEALTHY
+  CREDIT_STRONG_FINANCIAL_STRESSED
+  CREDIT_STRESSED_FINANCIAL_STRONG
+  BOTH_STRESSED
+  COMPLIANCE_HOLD
+}
+
+/// v3.0 §16.5's exact 6-band resolution-capacity table — an operational
+/// resolution-planning readiness label, never a loan-approval decision (the
+/// spec's own explicit instruction). Replaces the prior 4-band
+/// STRONG/MODERATE/LIMITED/UNKNOWN model: TIGHT and MARGINAL are new,
+/// narrower bands between "moderate" and "none," and NONE is now a distinct
+/// band from UNKNOWN (a real zero/negative surplus vs. genuinely
+/// insufficient data to assess at all).
+enum ResolutionCapacityLevel {
+  STRONG
+  MODERATE
+  TIGHT
+  MARGINAL
+  NONE
+  UNKNOWN
+}
+
+/// v3.0 §4.4.1's qualitative Data Quality band — replaces a numeric score
+/// entirely (§4.4.3: "v2.0's numeric DQ... hid more than it revealed").
+/// Conditions are L1 DQ band AND L2 DQ band AND a DQ-flag-count ceiling; see
+/// `computeDataQualityBand()`.
+enum MasterDataQualityBand {
+  HIGH
+  MODERATE
+  LOW_MODERATE
+  LOW
+  INSUFFICIENT
+}
+
+/// v3.0 §22.2's readiness-gate outcome — what happens next with this
+/// profile, never a go/no-go loan decision. READY means all R1-R8 passed and
+/// the profile may be handed to the Cohort Engine.
+enum ReadinessOutcome {
+  READY
+  CCR_FIRST
+  COMPLIANCE_HOLD
+  SPECIALIST_REVIEW
+  X1_CANDIDATE
+  REGENERATE
+}
+
+/// v3.0 §20.2's Missing Information Register priority tiers. P1 blocks
+/// cohort assignment entirely; P2 should be resolved before plan
+/// finalization; P3 is optional context.
+enum MirPriority {
+  P1
+  P2
+  P3
+}
+
+/// The spec's confidence model (Part 21/27): HIGH = both modules/multiple
+/// strong sources agree. MEDIUM = one strong source + supporting pattern.
+/// LOW = inference from incomplete/ambiguous evidence.
+enum MasterConfidenceLevel {
+  HIGH
+  MEDIUM
+  LOW
+}
+
+/// BBS Master Profile Module v3.0 §5.2's 8-state credit<->bank reconciliation
+/// match — richer than Financial Analysis's own 3-key risk-flag vocabulary
+/// (CREDIT_BANK_MATCH/CREDIT_OBLIGATION_NOT_OBSERVED/UNMATCHED_DEBT_PAYMENT),
+/// which this module translates into these states rather than recomputing
+/// the match itself. AMOUNT_MISMATCH, TIMING_MISMATCH, and POST_STATEMENT
+/// are new in v3.0 (the prior version only had the first 5). NOT_OBSERVED
+/// must never be read as "missed payment" — the payment may occur through
+/// another account, another cycle, or an unrecognized narration (the spec's
+/// own explicit instruction). POST_STATEMENT specifically means the L1
+/// account was opened after the L2 statement period ended — see
+/// `detectPostStatementDebt()`, which this exact customer's real Bajaj
+/// PL/CL accounts (opened Jul/Aug 2026, after the Apr2025-Mar2026 L2 window)
+/// exercises.
+enum ReconciliationMatchState {
+  MATCHED
+  PARTIALLY_MATCHED
+  NOT_OBSERVED
+  UNMATCHED_PAYMENT
+  AMOUNT_MISMATCH
+  TIMING_MISMATCH
+  POST_STATEMENT
+  UNKNOWN
+}
+
+/// Spec Part 23's change/trajectory vocabulary — always UNKNOWN in this
+/// version, since only one snapshot of each upstream module is ever
+/// available (exactly like Debt Analysis's own debtTrajectory(), which is
+/// always INSUFFICIENT_DATA today for the same reason). Kept as a real enum
+/// now so a later multi-snapshot capability needs no migration.
+enum FinancialTrajectory {
+  IMPROVING
+  STABLE
+  DETERIORATING
+  VOLATILE
+  UNKNOWN
+}
+
+// --- User & access management -------------------------------------------
+
+/// A CCR/supervisor/admin login account. Passwords are always bcrypt
+/// hashes — never store or log a plaintext password.
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  role         Role     @default(CCR)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  refreshTokens                RefreshToken[]
+  assignedLeads                Lead[]                     @relation("LeadAssignedCcr")
+  auditLogs                    AuditLog[]
+  uploadedDocuments            DocumentMetadata[]         @relation("DocumentUploadedBy")
+  verifiedDocuments            DocumentMetadata[]         @relation("DocumentVerifiedBy")
+  cohortOverridesActed         CohortOverride[]           @relation("CohortOverrideActor")
+  cohortOverridesApproved      CohortOverride[]           @relation("CohortOverrideApprover")
+  cohortComplianceActionsActed CohortComplianceDecision[] @relation("CohortComplianceActionActor")
+  bbsPlanOverridesActed        BbsPlanOverride[]          @relation("BbsPlanOverrideActor")
+  bbsPlanOverridesApproved     BbsPlanOverride[]          @relation("BbsPlanOverrideApprover")
+  bbsPlanConditionsVerified    BbsPlanCondition[]         @relation("BbsPlanConditionVerifiedBy")
+
+  @@index([role])
+}
+
+/// One row per issued refresh token. Only a hash of the token is stored
+/// (never the raw token), so a stolen DB dump can't be replayed directly.
+/// `revokedAt` supports logout / rotation without deleting the audit trail.
+model RefreshToken {
+  id        String    @id @default(cuid())
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+// --- Leads & customers ---------------------------------------------------
+
+/// The entry point of every customer journey. `bbsLeadId` is the stable,
+/// unique, human-facing identifier (e.g. "BBS-LD-100231") referenced by the
+/// frontend and by every other table transitively via `leadId`.
+model Lead {
+  id           String     @id @default(cuid())
+  bbsLeadId    String     @unique
+  fullName     String
+  phone        String
+  // Nullable: a public-website contact-form submission supplies neither —
+  // only a CCR-entered lead (via the internal Create Lead form) currently does.
+  email        String?
+  city         String?
+  source       LeadSource
+  notes        String?
+  // One-way hash of the PAN a public contact-form submitter typed in,
+  // never the raw PAN — used only to detect a repeat submission from the
+  // same identity. See PublicContactService.hashPan.
+  panRef       String?    @unique
+  // Structured mirror of the same two values folded into `notes` above by
+  // PublicContactService — kept separately so the Lead Details tab can
+  // display/edit them as real fields instead of parsing free text. Also
+  // settable on a CCR-entered lead, where they start blank.
+  helpCategory String?
+  situation    String?
+
+  assignedCcr   User?   @relation("LeadAssignedCcr", fields: [assignedCcrId], references: [id])
+  assignedCcrId String?
+
+  // Per-stage pipeline status — mirrors the frontend's LeadPipelineStatus.
+  leadSubmissionStatus StageStatus @default(COMPLETED)
+  bureauReportStatus   StageStatus @default(NOT_STARTED)
+  level1Status         StageStatus @default(NOT_STARTED)
+  level2Status         StageStatus @default(NOT_STARTED)
+  level3Status         StageStatus @default(NOT_STARTED)
+  recoveryPlanStatus   StageStatus @default(NOT_STARTED)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  customer              Customer?
+  consentRecords        ConsentRecord[]
+  documents             DocumentMetadata[]
+  creditReports         CreditReport[]
+  financialAssessments  FinancialAssessment[]
+  bankStatementAnalyses BankStatementAnalysis[]
+  customerProfiles      CustomerProfile[]
+  analysisJobs          AnalysisJob[]
+  masterProfiles        MasterProfile[]
+  cohortDecisions       CohortDecision[]
+  pathwayDecisions      PathwayDecision[]
+  recoveryPlans         RecoveryPlan[]
+  bbsPlans              BbsPlan[]
+  auditLogs             AuditLog[]
+
+  @@index([assignedCcrId])
+  @@index([city])
+  @@index([createdAt])
+}
+
+/// The customer record a Lead graduates into once past initial screening —
+/// though in practice this row is now created/updated incrementally as soon
+/// as a CCR fills in any part of the Lead Details tab, not atomically at a
+/// single "graduation" moment. Every field below (aside from id/leadId) is
+/// nullable for exactly that reason: a brand-new lead has a page to edit
+/// but nothing saved yet. `panRef` is an opaque token into a separate
+/// protected identifier store — never the raw PAN, and never used as a key.
+model Customer {
+  id                String    @id @default(cuid())
+  lead              Lead      @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  leadId            String    @unique
+  fullName          String?
+  phone             String?
+  email             String?
+  city              String?
+  dateOfBirth       DateTime?
+  occupation        String?
+  monthlyIncomeBand String?
+  stage             String?
+  panRef            String?   @unique
+
+  // --- Personal information ---
+  gender        String?
+  maritalStatus String?
+
+  // --- Contact information ---
+  alternateMobile String?
+
+  // --- Employment and income ---
+  employmentType         String?
+  companyName            String?
+  designation            String?
+  monthlySalary          Decimal? @db.Decimal(14, 2)
+  officialEmail          String?
+  workingExperienceYears Int?
+
+  // --- Current address ---
+  addressLine1 String?
+  addressLine2 String?
+  pinCode      String?
+  state        String?
+
+  // --- Permanent address — only meaningful when sameAsCurrentAddress is false ---
+  sameAsCurrentAddress  Boolean @default(true)
+  permanentAddressLine1 String?
+  permanentAddressLine2 String?
+  permanentCity         String?
+  permanentPinCode      String?
+  permanentState        String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  contacts Contact[]
+}
+
+/// Secondary contacts for a customer (emergency contact, reference, etc.).
+model Contact {
+  id         String   @id @default(cuid())
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  customerId String
+  type       String
+  name       String
+  phone      String?
+  email      String?
+  relation   String?
+  createdAt  DateTime @default(now())
+
+  @@index([customerId])
+}
+
+// --- Consent & documents --------------------------------------------------
+
+/// A single consent grant/revocation, versioned so a change in consent
+/// wording or scope never silently reinterprets a prior grant.
+model ConsentRecord {
+  id        String    @id @default(cuid())
+  lead      Lead      @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  leadId    String
+  purpose   String
+  version   String
+  status    String
+  grantedAt DateTime?
+  revokedAt DateTime?
+  /// The real client IP captured at the moment consent was granted (see
+  /// common/http/client-ip.ts) — part of the consent evidence itself, not
+  /// merely bureau-request plumbing. Nullable: null means "could not be
+  /// determined," never a fabricated value.
+  ipAddress String?
+  createdAt DateTime  @default(now())
+
+  @@index([leadId])
+}
+
+/// The canonical Documents-tab checklist slots (see DocumentChecklist in the
+/// frontend) — a closed enum rather than freeform text so the checklist can
+/// reliably match uploaded rows to a slot without string-matching drift.
+enum DocumentType {
+  PAN_CARD
+  AADHAAR_CARD
+  SALARY_SLIP
+  BANK_STATEMENT
+  FORM_16
+  LOAN_STATEMENT
+  FORECLOSURE_LETTER
+  ADDRESS_PROOF
+  EMPLOYMENT_PROOF
+  OTHER_SUPPORTING
+}
+
+/// A document is never auto-verified just by being uploaded — only an
+/// authorized CCR action moves it out of PENDING (see DocumentsService.verify).
+enum DocumentVerificationStatus {
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+/// Metadata for a private document (bureau report PDF, bank statement,
+/// etc.). `storageRef` is a private key/path resolved by the storage
+/// provider (see modules/documents/storage) — this table never holds a
+/// publicly reachable URL or the file bytes themselves; every read goes
+/// through an authenticated endpoint and is recorded in DocumentAccessLog.
+model DocumentMetadata {
+  id                 String                     @id @default(cuid())
+  lead               Lead                       @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  leadId             String
+  documentType       DocumentType
+  // The visitor/CCR-supplied filename, shown in the UI — never used to
+  // derive the actual on-disk/bucket path (see storageRef).
+  originalFilename   String
+  storageProvider    String
+  storageRef         String
+  mimeType           String
+  sizeBytes          Int
+  checksum           String
+  uploadedById       String?
+  uploadedBy         User?                      @relation("DocumentUploadedBy", fields: [uploadedById], references: [id])
+  verificationStatus DocumentVerificationStatus @default(PENDING)
+  verifiedById       String?
+  verifiedBy         User?                      @relation("DocumentVerifiedBy", fields: [verifiedById], references: [id])
+  verifiedAt         DateTime?
+  uploadedAt         DateTime                   @default(now())
+
+  accessLogs            DocumentAccessLog[]
+  bankStatementAnalysis BankStatementAnalysis?
+
+  @@index([leadId])
+  @@index([leadId, documentType])
+}
+
+/// Every read of a private document is recorded here — required for a
+/// financial-data audit trail.
+model DocumentAccessLog {
+  id               String           @id @default(cuid())
+  document         DocumentMetadata @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  documentId       String
+  accessedByUserId String
+  action           String
+  ipAddress        String?
+  accessedAt       DateTime         @default(now())
+
+  @@index([documentId])
+}
+
+// --- Assessments -----------------------------------------------------------
+
+/// A pulled bureau report summary. `maskedIdNumber` is always masked
+/// (e.g. "XXXX-XXXX-1234") — the raw identifier is never persisted here.
+///
+/// `leadId` is `@unique`: this is the actual enforcement mechanism for the
+/// "at most one Experian call per lead, ever" business rule (see
+/// BureauProcessingStatus's doc comment) — a second attempt's INSERT hits
+/// a real database unique-constraint violation, which is structurally
+/// impossible to race around even across concurrent requests or multiple
+/// backend instances. There is no "latest report" query anymore; there is
+/// exactly one CreditReport row per lead, updated in place through its
+/// lifecycle.
+model CreditReport {
+  id                      String                 @id @default(cuid())
+  lead                    Lead                   @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  leadId                  String                 @unique
+  bureau                  String
+  maskedIdNumber          String
+  pulledAt                DateTime
+  // Nullable: a verified real Experian response for an identity with no
+  // bureau record at all (INProfileResponse.SCORE.BureauScore = -1,
+  // Match_result.Exact_match = "N") reports no real score — see
+  // modules/bureau/providers/experian-response.mapper.ts. Never a
+  // fabricated placeholder number.
+  creditScore             Int?
+  // Bureau-assigned classification (e.g. "good"/"fair"/"poor") — the Debt
+  // Analysis tab's score-band label reads this stored field directly
+  // rather than computing its own thresholds, since this is the one place
+  // in the whole feature where an existing, already-persisted
+  // classification exists to reuse instead of inventing one. "not_found"
+  // is a real, verified value for the no-record-found case above — not a
+  // computed risk rating.
+  scoreBand               String
+  totalActiveAccounts     Int
+  totalOutstandingBalance Decimal                @db.Decimal(14, 2)
+  delinquentAccounts      Int
+  processingStatus        BureauProcessingStatus @default(IN_PROGRESS)
+  // Set for FAILED and REQUIRES_REVIEW — the bureau/transport/mapping
+  // error message, never a raw stack trace or the request credentials.
+  errorMessage            String?
+  // A short, stable discriminator (e.g. "BUREAU_TIMEOUT",
+  // "BUREAU_UNMAPPED_RESPONSE") — see CreditReportProviderError subclasses
+  // — so failure *type* can be queried/alerted on without string-matching
+  // errorMessage.
+  errorCode               String?
+  // The real Experian inner-payload response text, stored ONLY when a
+  // real response was actually received (never for a pure transport
+  // failure with no payload) — this is what lets a REQUIRES_REVIEW report
+  // be reprocessed after a mapper fix without ever calling Experian again
+  // (see BureauReportService.reprocessStoredResponse). Sensitive — never
+  // returned by any API response; dev/single-instance-only storage, same
+  // caveat as DocumentMetadata's local storage provider.
+  rawResponse             String?                @db.Text
+  completedAt             DateTime?
+  documentId              String?
+  // Nullable: not every bureau report includes a willful-defaulter
+  // determination — null must read as "not reported", never as false.
+  willfulDefaultFlag      Boolean?
+  createdAt               DateTime               @default(now())
+
+  accounts  CreditAccount[]
+  enquiries CreditEnquiry[]
+}
+
+/// A single tradeline from the bureau report. Every new nullable field below
+/// exists because DebtAnalysisService needs it and no equivalent field
+/// existed before this feature — see that service's calculation-rule
+/// comments for exactly how each one is used. Nullable (not defaulted to a
+/// "safe" value like 0/false) wherever the bureau may simply not report
+/// that attribute for a given tradeline, so "not reported" is never
+/// silently read as "zero"/"no".
+model CreditAccount {
+  id               String       @id @default(cuid())
+  creditReport     CreditReport @relation(fields: [creditReportId], references: [id], onDelete: Cascade)
+  creditReportId   String
+  accountType      String
+  lender           String
+  openedOn         DateTime
+  sanctionedAmount Decimal      @db.Decimal(14, 2)
+  currentBalance   Decimal      @db.Decimal(14, 2)
+  paymentStatus    String
+
+  // A bureau tradeline always reports an overdue amount (0 when current) —
+  // unlike the fields below, absence of overdue reporting isn't realistic,
+  // so this one is a plain non-null default rather than nullable.
+  overdueAmount Decimal @default(0) @db.Decimal(14, 2)
+
+  // --- DPD (days past due) ---
+  currentDpdDays Int?
+  maxDpdDays     Int?
+
+  // --- Loan economics ---
+  monthlyEmiAmount Decimal? @db.Decimal(14, 2)
+  // Populated for revolving/credit-card-type tradelines only — distinct
+  // from `sanctionedAmount` (a loan's original principal). Credit
+  // utilization is computed only over accounts where this is set, so a
+  // loan's principal is never mistaken for a revolving limit.
+  creditLimit      Decimal? @db.Decimal(14, 2)
+
+  isSecured Boolean?
+
+  // Freeform bureau account-status vocabulary: ACTIVE / CLOSED / SETTLED /
+  // WRITTEN_OFF / RESTRUCTURED / SUIT_FILED / ARC_ASSIGNED. Distinct from
+  // `paymentStatus` above (which reflects payment regularity, not lifecycle).
+  lifecycleStatus String?
+
+  // The bureau's own account-closure date (Experian's Date_Closed / Signzy's
+  // equivalent field — both raw formats send this; only lifecycleStatus was
+  // ever captured before, never the date itself). Null for any account that
+  // predates this column (reported before a mapper reprocess) as well as
+  // for any account genuinely still open — both cases render as an honest
+  // "not available" in the Account Timeline, never inferred from
+  // lifecycleStatus alone.
+  closedOn DateTime?
+
+  // Up to ~12 months of { month: "YYYY-MM", dpdBucket: "0"|"30"|"60"|"90+" }
+  // entries — the real "payment history grid" structure bureau reports
+  // include per tradeline. Powers repayment-behavior percentages and the
+  // credit-history trend chart; both read "not present" as unavailable,
+  // never as a run of on-time months.
+  paymentHistoryGrid Json?
+
+  @@index([creditReportId])
+}
+
+/// A single hard/soft enquiry record from the bureau report.
+model CreditEnquiry {
+  id             String       @id @default(cuid())
+  creditReport   CreditReport @relation(fields: [creditReportId], references: [id], onDelete: Cascade)
+  creditReportId String
+  enquiryDate    DateTime
+  purpose        String
+  memberName     String
+
+  @@index([creditReportId])
+}
+
+/// Generic Level 1 (credit screening) / Level 2 (financial profile)
+/// assessment. `level` distinguishes the two; `data` holds the
+/// level-specific structured payload (risk grade & DTI for L1, income /
+/// affordability breakdown for L2) so both levels share one lifecycle +
+/// versioning model instead of near-duplicate tables. A new row is always
+/// inserted with `version` incremented — existing rows are never
+/// overwritten, so a CCR-verified assessment can't be silently replaced.
+model FinancialAssessment {
+  id           String      @id @default(cuid())
+  lead         Lead        @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  leadId       String
+  level        Int
+  version      Int         @default(1)
+  status       StageStatus @default(PENDING)
+  data         Json
+  assessedById String?
+  createdAt    DateTime    @default(now())
+
+  bankTransactions BankTransaction[]
+
+  @@unique([leadId, level, version])
+  @@index([leadId, level])
+}
+
+/// Bank statement line items backing a Level 2 affordability assessment.
+model BankTransaction {
+  id                    String              @id @default(cuid())
+  financialAssessment   FinancialAssessment @relation(fields: [financialAssessmentId], references: [id], onDelete: Cascade)
+  financialAssessmentId String
+  transactionDate       DateTime
+  description           String
+  amount                Decimal             @db.Decimal(14, 2)
+  type                  String
+  balanceAfter          Decimal             @db.Decimal(14, 2)
+  isBounced             Boolean             @default(false)
+  createdAt             DateTime            @default(now())
+
+  @@index([financialAssessmentId])
+}
+
+/// Level 3: the holistic customer profile that recommends a cohort.
+/// Kept as its own model (distinct from FinancialAssessment) because its
+/// shape — composite risk score, stability indicators, cohort
+/// recommendation — is meaningfully different from L1/L2. Versioned the
+/// same way: append, never overwrite.
+model CustomerProfile {
+  id                  String      @id @default(cuid())
+  lead                Lead        @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  leadId              String
+  version             Int         @default(1)
+  status              StageStatus @default(PENDING)
+  compositeRiskScore  Int?
+  stabilityIndicators Json?
+  recommendedCohort   String?
+  assessorId          String?
+  assessorNotes       String?
+  assessedAt          DateTime?
+  createdAt           DateTime    @default(now())
+
+  @@unique([leadId, version])
+  @@index([leadId])
+}
+
+// --- Financial Analysis (bank-statement-driven) -------------------------
+//
+// FinancialAssessment/BankTransaction above are a pre-existing, generic,
+// versioned Json-blob model that is confirmed unused by any code anywhere
+// in this repo. They are left untouched (no migration risk either way) —
+// the models below are new and purpose-built for a typed, 30-rule
+// deterministic engine, following the same typed-column convention
+// CreditReport/CreditAccount/CreditEnquiry already established, not the
+// older Json-blob one.
+
+/// One row per uploaded BANK_STATEMENT document — this pipeline's own
+/// status/lifecycle record, directly analogous to CreditReport's role for
+/// the bureau pipeline. `documentId` is `@unique`: the atomic
+/// "reserve-before-work" discipline (insert this row in its initial
+/// UPLOADED status before any parsing begins) is what actually prevents a
+/// document from being processed twice concurrently — same mechanism
+/// CreditReport.leadId uses for the bureau call. A lead that uploads
+/// several bank-statement documents (e.g. a corrected re-upload) gets one
+/// BankStatementAnalysis row per document, not one per lead.
+model BankStatementAnalysis {
+  id         String           @id @default(cuid())
+  lead       Lead             @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  leadId     String
+  document   DocumentMetadata @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  documentId String           @unique
+
+  status       FinancialAnalysisStatus @default(UPLOADED)
+  // Set for FAILED — e.g. "PDF_PASSWORD_PROTECTED", "SCANNED_PDF_UNSUPPORTED",
+  // "unsupported layout". Never a raw stack trace.
+  errorMessage String?
+  errorCode    String?
+
+  sourceFileFormat     BankStatementFileFormat
+  // A stable discriminator for which parser/heuristic actually ran (e.g.
+  // "csv-v1"/"xlsx-v1"/"pdf-heuristic-v1") — lets a developer reprocess
+  // affected documents after a specific parser is fixed.
+  parsingMethod        String?
+  // Document-level confidence in the raw extraction itself (before
+  // classification) — always lower for PDF than for XLSX/CSV, per the
+  // confirmed v1 PDF-parsing scope. Null until EXTRACTING completes.
+  extractionConfidence Float?
+
+  // Nullable throughout: not every statement format/layout reports every
+  // field, and a value here is never fabricated as 0/empty when unreported.
+  bankName             String?
+  accountNumberMasked  String?
+  statementPeriodStart DateTime?
+  statementPeriodEnd   DateTime?
+  openingBalance       Decimal?  @db.Decimal(14, 2)
+  closingBalance       Decimal?  @db.Decimal(14, 2)
+  transactionCount     Int?
+  monthsCovered        Int?
+
+  /// Statement-header identity/bank metadata (v4.0 spec §3.1-3.6) — extracted
+  /// only when the statement header literally states it (e.g. "Account
+  /// Holder:", "IFSC:", "A/C Type:" lines); never fabricated, never derived
+  /// from the account holder's Lead/Customer record (this module stays a
+  /// pure bank-statement reader, never cross-populates identity FROM the
+  /// CRM — the comparison, if any, belongs to a consumer of this data, not
+  /// to the extractor itself). Null means "not stated in this statement,"
+  /// same honesty convention as bankName/accountNumberMasked above.
+  accountHolderName String?
+  ifscCode          String?
+  accountType       String?
+
+  // Line-level parse issues (e.g. "row 47: balance column unparseable") —
+  // never the raw file bytes, never PII beyond what's already in the
+  // narration itself.
+  parserWarnings Json?
+
+  completedAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  transactions NormalizedTransaction[]
+  months       MonthlyFinancialAggregate[]
+  score        FinancialHealthScore?
+  riskFlags    FinancialRiskFlag[]
+
+  @@index([leadId])
+}
+
+/// The spec's own "normalized transaction model," stored as a real,
+/// queryable table (not a Json blob) — at roughly a year × dozens of
+/// transactions/month, a few hundred rows per analysis is trivial for
+/// Postgres, and a real table is what the monthly-timeline/large-
+/// transaction/bounce-bucket/correlation UI actually needs to query
+/// (GROUP BY category, ORDER BY amount DESC, WHERE bounceEvidence = ...) —
+/// the same reasoning that already justified CreditAccount as a real
+/// table rather than folding tradelines into CreditReport.rawResponse.
+/// Reprocessing a document deletes and recreates every row for that
+/// analysisId in one transaction — never an in-place partial patch, same
+/// discipline BureauReportService already uses for CreditAccount rows.
+model NormalizedTransaction {
+  id               String                @id @default(cuid())
+  analysis         BankStatementAnalysis @relation(fields: [analysisId], references: [id], onDelete: Cascade)
+  analysisId       String
+  // Denormalized for convenient lead-level queries (e.g. a combined
+  // timeline across more than one uploaded statement) without joining
+  // through BankStatementAnalysis every time.
+  leadId           String
+  // The spec's own field name — the originating DocumentMetadata.id, kept
+  // directly on the row so a transaction's provenance survives even if a
+  // future feature merges transactions from multiple source documents.
+  sourceDocumentId String
+
+  transactionDate DateTime
+  valueDate       DateTime?
+  narration       String               @db.Text
+  amount          Decimal              @db.Decimal(14, 2)
+  direction       TransactionDirection
+  // Nullable — never defaulted to 0. A statement row that doesn't carry a
+  // running balance (or an unparseable balance cell) must read as "balance
+  // not reported," never as "balance is zero."
+  balance         Decimal?             @db.Decimal(14, 2)
+  counterparty    String?
+  transactionType String?
+  category        TransactionCategory  @default(UNCLASSIFIED)
+  // Free-text, validated at the application layer against the spec's exact
+  // per-category subcategory list — see TransactionCategory's own doc
+  // comment for why this is a string, not a second enum.
+  subcategory     String?
+  lender          String?
+  confidence      Float
+  evidenceLevel   EvidenceLevel
+  bounceEvidence  BounceEvidenceTier?
+
+  /// Narration canonical-field parse (v4.0 spec §3.8) — {referenceNumber,
+  /// counterpartyRaw, purpose, counterpartyBank}, each null when the
+  /// narration didn't match a recognized structural pattern (UPI/IMPS/NEFT/
+  /// ACH/SB — see classification/narration-detail-parser.ts). Bundled as
+  /// one Json column (same convention as FinancialRiskFlag.evidence) since
+  /// nothing here needs independent SQL querying — display/report detail
+  /// only, never a second source of truth for category/subcategory/lender.
+  narrationDetail Json?
+
+  // Line/row index in the source file — debugging/audit only, never
+  // exposed as if it were evidence of anything financial.
+  sourceRowRef Int?
+
+  createdAt DateTime @default(now())
+
+  riskFlags FinancialRiskFlag[]
+
+  @@index([analysisId])
+  @@index([leadId, transactionDate])
+  @@index([leadId, category])
+}
+
+/// One row per calendar month covered by the statement — the monthly
+/// timeline the drill-down UI reads directly, and the unit every scoring
+/// rule (F05-F16) operates over. Computed once at the ANALYZING stage and
+/// persisted (not recomputed per request) because classification + monthly
+/// bucketing over a year of heuristically-parsed transactions is real
+/// work, unlike Debt Analysis's cheap per-request recompute over a handful
+/// of tradelines.
+model MonthlyFinancialAggregate {
+  id          String                @id @default(cuid())
+  analysis    BankStatementAnalysis @relation(fields: [analysisId], references: [id], onDelete: Cascade)
+  analysisId  String
+  leadId      String
+  periodMonth DateTime // first-of-month, UTC — canonical sort/lookup key
+
+  totalInflow           Decimal @default(0) @db.Decimal(14, 2)
+  totalOutflow          Decimal @default(0) @db.Decimal(14, 2)
+  netCashFlow           Decimal @default(0) @db.Decimal(14, 2)
+  // Rule 17: normalized income EXCLUDING loan proceeds/self-transfers/
+  // refunds/unclassified P2P — a real, confirmed 0 is meaningful here
+  // (genuinely no qualifying income this month), distinct from "not
+  // reported" (which the balance-derived fields below use null for).
+  normalizedIncome      Decimal @default(0) @db.Decimal(14, 2)
+  essentialExpenses     Decimal @default(0) @db.Decimal(14, 2)
+  financialExpenses     Decimal @default(0) @db.Decimal(14, 2)
+  discretionaryExpenses Decimal @default(0) @db.Decimal(14, 2)
+  // Subset of financialExpenses used for F08/F09 (EMI + loan repayment
+  // only) — deliberately EXCLUDES credit-card payment, to avoid the F17
+  // double-count the spec calls out explicitly (D05).
+  mandatoryDebtPayments Decimal @default(0) @db.Decimal(14, 2)
+  creditCardPayments    Decimal @default(0) @db.Decimal(14, 2)
+  loanInflows           Decimal @default(0) @db.Decimal(14, 2)
+  transferInflows       Decimal @default(0) @db.Decimal(14, 2)
+  transferOutflows      Decimal @default(0) @db.Decimal(14, 2)
+  cashWithdrawals       Decimal @default(0) @db.Decimal(14, 2)
+  cashDeposits          Decimal @default(0) @db.Decimal(14, 2)
+
+  // Balance-derived fields stay nullable — never defaulted to 0/false.
+  // Null here means "this month's statement rows had no parseable running
+  // balance," a materially different, honest fact from "balance reached
+  // zero" or "no negative balance occurred" (per D12).
+  closingBalance     Decimal? @db.Decimal(14, 2)
+  minBalance         Decimal? @db.Decimal(14, 2)
+  lowBalanceDays     Int?
+  observedDays       Int
+  hadNegativeBalance Boolean?
+
+  transactionCount       Int     @default(0)
+  isExceptionalMonth     Boolean @default(false)
+  exceptionalMonthReason String?
+
+  createdAt DateTime @default(now())
+
+  @@unique([analysisId, periodMonth])
+  @@index([leadId, periodMonth])
+}
+
+/// One-to-one with BankStatementAnalysis, exactly like AnalysisResult is
+/// one-to-one with AnalysisJob — the deterministic scoring OUTPUT, kept
+/// separate from the pipeline-status row it was computed from. Each of the
+/// 9 weighted components gets its own nullable score + a DataAvailability
+/// string (see src/features/leads/types.ts's DataAvailability on the
+/// frontend; the backend convention — see debt-analysis.types.ts — passes
+/// the same 4-value string through untyped at the Prisma layer, same as
+/// AnalysisJob.jobType), instead of one combined Json blob.
+model FinancialHealthScore {
+  id         String                @id @default(cuid())
+  analysis   BankStatementAnalysis @relation(fields: [analysisId], references: [id], onDelete: Cascade)
+  analysisId String                @unique
+
+  // Null score (not 0) when that component genuinely could not be
+  // computed (e.g. creditPaymentBehaviour needs >=1 detected card/CRED
+  // payment to score) — availability explains why.
+  incomeStabilityScore               Int?
+  incomeStabilityAvailability        String
+  cashFlowStrengthScore              Int?
+  cashFlowStrengthAvailability       String
+  debtServicingCapacityScore         Int?
+  debtServicingCapacityAvailability  String
+  liquidityScore                     Int?
+  liquidityAvailability              String
+  expenseBehaviourScore              Int?
+  expenseBehaviourAvailability       String
+  borrowingDependencyScore           Int?
+  borrowingDependencyAvailability    String
+  creditPaymentBehaviourScore        Int?
+  creditPaymentBehaviourAvailability String
+  transactionBehaviourScore          Int?
+  transactionBehaviourAvailability   String
+  stressSignalsScore                 Int?
+  stressSignalsAvailability          String
+
+  // Sum of whatever components ARE available — explicitly labeled partial
+  // rather than silently presented as a full, precise 100-point score.
+  totalScore          Int?
+  scorePartial        Boolean @default(false)
+  /// Sum of maxPoints across only the AVAILABLE components — e.g. 85, not
+  /// a blind 100, when one or more components were unavailable. Lets a
+  /// consumer show "62 of 85 assessable points" instead of misleadingly
+  /// implying "62 / 100". Equals 100 whenever scorePartial is false.
+  maxAchievablePoints Int?
+  /// Per-component {maxPoints, available, reason} breakdown — the richer
+  /// detail each scoring function already computes (ComponentScoreResult's
+  /// own `detail`/`maxPoints`) but which the scalar columns above don't
+  /// carry. Never a source of truth by itself — the scalar *Score/
+  /// *Availability columns above remain authoritative; this is display
+  /// detail only.
+  componentDetails    Json?
+
+  // The SEPARATE 0-100 stress indicator + band — see FinancialStressBand's
+  // own doc comment for why this is never combined with the 5-point
+  // stressSignalsScore component above.
+  stressIndicator0to100 Int
+  stressBand            FinancialStressBand
+
+  /// Additive bundle of the v4.0 spec's genuinely NEW derived analysis that
+  /// sits on top of (never inside) the 9-component score above: balance
+  /// reconciliation, FCF theoretical/actual reconciliation + attribution,
+  /// the DSR fixed/total/with-discretionary breakdown, score-vs-cash-flow
+  /// divergence, the 5-component capped Data Quality Score, and the
+  /// Missing Information Register — see calculations/extended-metrics.ts
+  /// for the exact shape. Bundled as one Json column (same convention as
+  /// componentDetails above) rather than one column per metric, since none
+  /// of these need independent SQL querying — display/report detail only.
+  extendedAnalysis Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([analysisId])
+}
+
+/// Every risk flag from the spec's exact list, including the credit-report
+/// correlation outcomes (CREDIT_BANK_MATCH / CREDIT_OBLIGATION_NOT_OBSERVED
+/// / UNMATCHED_DEBT_PAYMENT) — folded in here rather than a separate
+/// correlation table, since they're already full members of the spec's
+/// unified risk-flag list and need the same severity/evidence shape as
+/// every other flag. Mirrors debt-analysis's RiskFlag.evidence convention:
+/// the real number(s)/string(s) the flag's condition was evaluated against.
+model FinancialRiskFlag {
+  id         String                @id @default(cuid())
+  analysis   BankStatementAnalysis @relation(fields: [analysisId], references: [id], onDelete: Cascade)
+  analysisId String
+
+  key      String // one of the spec's exact flag keys, e.g. "INCOME_VOLATILE"
+  severity FinancialFlagSeverity
+  detail   String
+  evidence Json
+
+  relatedMonth         DateTime?
+  relatedTransaction   NormalizedTransaction? @relation(fields: [relatedTransactionId], references: [id], onDelete: SetNull)
+  relatedTransactionId String?
+
+  createdAt DateTime @default(now())
+
+  @@index([analysisId])
+  @@index([analysisId, severity])
+  @@index([key])
+}
+
+// --- AI & workflow -----------------------------------------------------
+
+/// One async unit of analysis work (an L1/L2/L3 pass, or recovery-plan
+/// generation). `provider` is provider-independent — swapping the AI
+/// backend never changes this table's shape, only which value gets stored.
+model AnalysisJob {
+  id             String            @id @default(cuid())
+  lead           Lead              @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  leadId         String
+  jobType        String
+  provider       AiProvider        @default(MOCK)
+  status         AnalysisJobStatus @default(QUEUED)
+  requestPayload Json
+  errorMessage   String?
+  startedAt      DateTime?
+  completedAt    DateTime?
+  createdAt      DateTime          @default(now())
+
+  result AnalysisResult?
+
+  @@index([leadId])
+  @@index([status])
+}
+
+/// The AI-generated output of an AnalysisJob. Deliberately separate from
+/// FinancialAssessment/CustomerProfile/CohortDecision: those are the
+/// deterministic, CCR-verified records of truth; this table holds only the
+/// raw model output that fed into (but does not itself constitute) them.
+model AnalysisResult {
+  id           String      @id @default(cuid())
+  job          AnalysisJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  jobId        String      @unique
+  findings     Json
+  confidence   Float?
+  modelVersion String?
+  createdAt    DateTime    @default(now())
+}
+
+/// The BBS Cohort Engine's own deterministic classification + precedence
+/// layer, sitting directly on Master Profile's `cohortAttributes` output
+/// (that field's own doc comment calls this module out by name as its
+/// intended consumer). Versioned append-only (`@@unique([leadId,
+/// version])`), exactly like MasterProfile — a new version is created only
+/// by an explicit CCR "Evaluate"/"Recalculate" action or a CCR override,
+/// never silently recomputed, and never overwrites a prior (possibly
+/// CCR-validated) row. `cohort`/`decisionRationale` (the original two
+/// fields here) are replaced by the new typed `primaryCohort` enum +
+/// `customerExplanation` below — nothing ever read the old untyped string
+/// pair, so they are dropped rather than kept as a second, drift-prone
+/// mirror of the same concept.
+model CohortDecision {
+  id                String  @id @default(cuid())
+  lead              Lead    @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  leadId            String
+  customerProfileId String?
+  version           Int     @default(1)
+
+  status       CohortDecisionStatus @default(GENERATING)
+  errorMessage String?
+
+  // The exact ruleVersion/policy snapshot this decision was produced
+  // under (see configuration.ts's `cohortEngine` block) — a plain,
+  // manually-bumped version string, not a dynamic policy-admin table (no
+  // module in this codebase has ever built one; see this model's own
+  // build notes).
+  ruleVersion String
+
+  // Captured at generation time — the same staleness-detection discipline
+  // MasterProfile.getForLead() already uses, so this engine never runs
+  // against stale upstream data without the CCR being told. No
+  // sourceMasterProfileId column: Master Profile's own `version` number
+  // (compared against its CURRENT live version on every getForLead() call)
+  // already gives a complete staleness signal without a second id lookup.
+  sourceMasterProfileVersion         Int?
+  sourceMasterProfileGeneratedAt     DateTime?
+  // The credit report's own pulled-at date (Debt Analysis exposes no
+  // separate "completedAt" — this is the closest real analog).
+  sourceDebtAnalysisCompletedAt      DateTime?
+  sourceFinancialAnalysisCompletedAt DateTime?
+
+  generatedAt DateTime? // engine computation time — null until COMPLETED
+  decidedAt   DateTime? // CCR validation time — null until a CCR actually validates this decision
+
+  // Deterministic classification output (spec's Output Schema, Part 8/11).
+  primaryCohort            CohortPrimaryState?
+  secondaryFlags           Json?
+  archetype                CohortArchetype?
+  pathway                  CohortPathway?
+  capacityBand             CapacityBand?
+  capacityRatio            Float?
+  sustainableCashFlow      Decimal?               @db.Decimal(14, 2)
+  stabilisationCoverage    Float?
+  debtComplexityBand       DebtComplexityBand?
+  planEligibility          CohortPlanEligibility?
+  customerExplanation      String?
+  missingData              Json?
+  requiredDocuments        Json?
+  specialistReviewRequired Boolean                @default(false)
+  // The algorithmic engine itself could not produce a confident cohort —
+  // distinct from `requiresManualOverride` below (a CCR later overrode an
+  // already-produced decision).
+  manualReviewRequired     Boolean                @default(false)
+  confidence               CohortConfidenceLevel?
+  dataProvenance           Json?
+  consentVersion           String?
+  nextReviewEvent          Json?
+
+  // v3.0 additions — all additive/nullable, so a legacy pre-v3.0 decision
+  // row (built under the old 22-rule/11-priority design) simply omits them
+  // rather than needing a backfill.
+  lifecycleState CohortLifecycleState?
+
+  // §7: compliance hold lifecycle — distinct from (and can co-exist
+  // alongside) the cohort's own primaryCohort=COMPLIANCE_HOLD reason code,
+  // since this sub-state machine tracks aging/escalation independently of
+  // whichever BLOCKED reason is currently primary.
+  complianceHold          Boolean                     @default(false)
+  complianceReason        String?
+  complianceMatchedEntity String?
+  complianceSlaHours      Int?
+  complianceEscalationAt  DateTime?
+  complianceAgingState    CohortComplianceAgingState?
+  complianceClearedAt     DateTime?
+  complianceDeclinedAt    DateTime?
+
+  // §5.4/§17: a plain-language reason the boolean specialistReviewRequired
+  // alone can't carry (e.g. "Exception count 8; compliance hold").
+  specialistReviewReason String?
+
+  // §12/§17.1: the spec's own exact output-schema arrays — additive
+  // alongside the pre-existing `customerExplanation` single-string field
+  // (kept for backward compatibility; new code populates both).
+  customerReasons Json?
+  internalReasons Json?
+
+  // §14.3: the explicit customer-decline path — distinct from
+  // CUSTOMER_UNRESPONSIVE (cannot reach) and from an algorithmic BLOCKED
+  // reason (something BBS needs, not something the customer decided).
+  declinedAt    DateTime?
+  declineReason String?
+
+  // Pre-existing fields, semantics unchanged.
+  decisionRationale      String?
+  decidedById            String?
+  requiresManualOverride Boolean @default(false)
+
+  ruleResults           CohortRuleResult[]
+  recoveryPlans         RecoveryPlan[]
+  bbsPlans              BbsPlan[]
+  pathwayDecisions      PathwayDecision[]
+  overridesFrom         CohortOverride[]           @relation("PreviousDecision")
+  overridesTo           CohortOverride[]           @relation("NewDecision")
+  complianceActionsFrom CohortComplianceDecision[] @relation("PreviousComplianceDecision")
+  complianceActionsTo   CohortComplianceDecision[] @relation("NewComplianceDecision")
+
+  @@unique([leadId, version])
+  @@index([leadId])
+}
+
+/// The BBS Cohort Engine's own pipeline status — a bespoke enum (not the
+/// shared StageStatus), following the FinancialAnalysisStatus/
+/// MasterProfileStatus convention.
+enum CohortDecisionStatus {
+  GENERATING
+  COMPLETED
+  FAILED
+}
+
+/// BBS Cohort Engine Module v3.0 §4: the unified state model. `primaryCohort`
+/// stores EITHER a real Type-A terminal cohort (C1-C7, X1, X2) OR, when the
+/// case cannot proceed, the SPECIFIC blocked-reason code — v3.0's own
+/// output schema always derives a single `primary_state` (`C1`..`X2` or the
+/// literal `BLOCKED`) plus a separate `primary_reason_code` (set only when
+/// blocked) from this one column at the API boundary (see
+/// `isBlockedReasonCode()`/`toPrimaryStateAndReasonCode()` in
+/// cohort-engine.types.ts) — never two parallel columns that could drift.
+/// v2.0's 13 values are extended additively (never removed — existing rows
+/// keep their old value unchanged) with v3.0's new reason codes:
+/// COMPLIANCE_HOLD, DATA_REFRESH_REQUIRED, OTHER_ACCOUNTS_REQUIRED,
+/// P1_INFORMATION_REQUIRED, SPECIALIST_REQUIRED, CCR_REQUIRED (§3.2's
+/// CCR_FIRST readiness-gate routing). CUSTOMER_UNRESPONSIVE is kept for
+/// backward compatibility with historical rows; the algorithmic engine
+/// still never auto-assigns it (no honest engagement signal exists) — v3.0
+/// instead models an explicit customer decision via `CUSTOMER_DECLINED` on
+/// `CohortLifecycleState` below, a different concept (declined vs.
+/// unreachable).
+enum CohortPrimaryState {
+  CONSENT_PENDING
+  KYC_PENDING
+  X1
+  C6
+  C5
+  C4
+  C3
+  C2
+  C1
+  C7
+  X2
+  MANUAL_REVIEW
+  CUSTOMER_UNRESPONSIVE
+  COMPLIANCE_HOLD
+  DATA_REFRESH_REQUIRED
+  OTHER_ACCOUNTS_REQUIRED
+  P1_INFORMATION_REQUIRED
+  SPECIALIST_REQUIRED
+  CCR_REQUIRED
+}
+
+/// v3.0 §4.2 Type C — lifecycle states, applying once a real cohort (not a
+/// BLOCKED reason) has been assigned and the case moves toward a BBS Plan.
+/// `CUSTOMER_DECLINED` and `STALE_90D` are terminal states reachable from
+/// anywhere (§4.2/§14.3), not strictly sequential with the others.
+enum CohortLifecycleState {
+  CCR_REVIEW
+  CUSTOMER_ACCEPTANCE_PENDING
+  EXECUTION_READY
+  ACTIVE
+  COMPLETED
+  CANCELLED
+  CUSTOMER_DECLINED
+  STALE_90D
+}
+
+/// v3.0 §7.3: the compliance hold's own aging/escalation sub-state machine,
+/// independent of the cohort's primary_state/lifecycle_state — tracks SLA
+/// aging and the §7.4 feedback loop (cleared -> re-enter precedence,
+/// declined -> X2).
+enum CohortComplianceAgingState {
+  COMPLIANCE_HOLD
+  COMPLIANCE_AGING
+  COMPLIANCE_ESCALATED
+  COMPLIANCE_CLEARED
+  COMPLIANCE_DECLINED
+}
+
+/// Output Schema's `archetype` field — CIRCUMSTANTIAL/DEBT_SPIRAL/
+/// HABITUAL_AVOIDER are a first-draft heuristic over already-computed
+/// debt-cycle/capacity signals (neither source document gives an exact
+/// formula), defaulting to UNCLASSIFIED far more often than not — no
+/// customer-engagement/override history exists anywhere in this codebase
+/// to meaningfully ground HABITUAL_AVOIDER today. INTERNAL-ONLY — never
+/// exposed to the customer (spec Part 24).
+enum CohortArchetype {
+  CIRCUMSTANTIAL
+  DEBT_SPIRAL
+  HABITUAL_AVOIDER
+  UNCLASSIFIED
+}
+
+/// Output Schema's `recommended_pathway` vocabulary, verbatim.
+enum CohortPathway {
+  OPTIMISE
+  STABILISE
+  CONSOLIDATE
+  RESTRUCTURE
+  RESOLVE
+  RECOVER
+}
+
+/// Capacity & Affordability Logic sheet's exact bands (Pilot V1 — see
+/// configuration.ts's cohortEngine block for the ratio thresholds).
+enum CapacityBand {
+  DISTRESSED
+  STRESSED
+  TIGHT
+  COMFORTABLE
+  /// v3.0 §5.2 R013: capacity cannot be computed at all (income/essential
+  /// expenses/mandatory debt payments unavailable) — distinct from
+  /// "fcf_reconciled=false", which caps at STRESSED rather than reporting
+  /// UNKNOWN (a theoretical surplus still exists in that case).
+  UNKNOWN
+}
+
+/// Output Schema's `debt_complexity_band` vocabulary — derived from
+/// already-computed Debt Analysis figures (lenderCount/totalDebtBand/
+/// product diversity), no formula given in either source document but
+/// low-risk to derive now (real, already-available inputs).
+enum DebtComplexityBand {
+  LOW
+  MODERATE
+  HIGH
+  VERY_HIGH
+}
+
+/// Output Schema's `plan_eligibility` vocabulary, verbatim.
+enum CohortPlanEligibility {
+  DRAFT
+  CCR_REVIEW
+  SPECIALIST
+  INSUFFICIENT_DATA
+  OUT_OF_SCOPE
+}
+
+/// The spec's own confidence model, reused structurally from Master
+/// Profile but kept as a SEPARATE enum — Cohort Engine's own scale is
+/// deliberately independently evolvable from Master Profile's identical-
+/// shaped one, consistent with this codebase's per-module scale
+/// convention.
+enum CohortConfidenceLevel {
+  HIGH
+  MEDIUM
+  LOW
+}
+
+/// Rule Catalog sheet's own severity vocabulary.
+enum CohortRuleSeverity {
+  HIGH
+  MEDIUM
+  LOW
+}
+
+/// Spec Part 27's exact vocabulary for this module — deliberately its own
+/// 4-tier scale (CONFIRMED/DERIVED/INDICATED/UNKNOWN), distinct in name
+/// from Financial Analysis's CONFIRMED/DERIVED/INFERRED and Debt
+/// Analysis's KNOWN/INDICATED/UNKNOWN, so a CCR can tell which module's
+/// evidence scale a given badge belongs to.
+enum CohortEvidenceLevel {
+  CONFIRMED
+  DERIVED
+  INDICATED
+  UNKNOWN
+}
+
+/// One row per rule evaluated for a given decision (R001-R022) — a real,
+/// independently-queryable table (not a Json blob on CohortDecision),
+/// same reasoning as MasterProfileReconciliationRow/FinancialRiskFlag:
+/// the CCR UI needs a sortable, per-rule expandable table. `evaluated:
+/// false` means the rule's required source signal was itself
+/// NOT_REPORTED/UNKNOWN (not "skipped") — itself a direct input to the
+/// X1 Insufficient Data determination, never silently dropped.
+model CohortRuleResult {
+  id            String              @id @default(cuid())
+  decision      CohortDecision      @relation(fields: [decisionId], references: [id], onDelete: Cascade)
+  decisionId    String
+  ruleId        String // e.g. "R009"
+  ruleVersion   String
+  evaluated     Boolean
+  matched       Boolean
+  severity      CohortRuleSeverity
+  evidence      Json
+  evidenceLevel CohortEvidenceLevel
+  reason        String
+  sourceFields  Json
+
+  @@index([decisionId])
+  @@index([ruleId])
+}
+
+/// A CCR/supervisor override of an algorithmic decision. Never mutates
+/// the original decision — it creates a NEW CohortDecision version
+/// (primaryCohort = the overridden value) and links both ends here,
+/// keeping every prior decision immutable ("do not overwrite historical
+/// decisions" — the spec's own explicit invariant).
+model CohortOverride {
+  id                 String              @id @default(cuid())
+  // CRITICAL: Restrict, not Cascade — this model's own purpose (see its
+  // doc comment above) is to keep every overridden decision's audit trail
+  // outliving the decision itself; cascading its deletion away on a
+  // parent delete would silently destroy the exact audit trail it exists
+  // to preserve. No delete endpoint exists anywhere in this codebase
+  // today (confirmed via grep) — this is a latent-integrity fix for
+  // whatever cleanup/GDPR-delete tooling gets built later, not a fix to
+  // any currently-reachable bug.
+  previousDecision   CohortDecision      @relation("PreviousDecision", fields: [previousDecisionId], references: [id], onDelete: Restrict)
+  previousDecisionId String
+  newDecision        CohortDecision      @relation("NewDecision", fields: [newDecisionId], references: [id], onDelete: Restrict)
+  newDecisionId      String              @unique
+  oldPrimaryCohort   CohortPrimaryState?
+  newPrimaryCohort   CohortPrimaryState
+  reason             String
+  actor              User                @relation("CohortOverrideActor", fields: [actorId], references: [id])
+  actorId            String
+  approver           User?               @relation("CohortOverrideApprover", fields: [approverId], references: [id])
+  approverId         String?
+  createdAt          DateTime            @default(now())
+
+  @@index([previousDecisionId])
+}
+
+/// v3.0 §7.4's compliance clear/decline feedback loop. Never mutates the
+/// original (compliance-held) decision — creates a NEW CohortDecision
+/// version (the "next-highest" candidate on CLEARED, or X2 on DECLINED)
+/// and links both ends here, same immutable-audit-trail discipline as
+/// CohortOverride. A distinct model from CohortOverride because this is a
+/// different real-world action (a compliance team's own resolution of a
+/// hold they themselves created), not a CCR/supervisor second-guessing an
+/// algorithmic cohort assignment.
+model CohortComplianceDecision {
+  id                 String                     @id @default(cuid())
+  previousDecision   CohortDecision             @relation("PreviousComplianceDecision", fields: [previousDecisionId], references: [id], onDelete: Restrict)
+  previousDecisionId String
+  newDecision        CohortDecision             @relation("NewComplianceDecision", fields: [newDecisionId], references: [id], onDelete: Restrict)
+  newDecisionId      String                     @unique
+  action             CohortComplianceActionType
+  oldPrimaryCohort   CohortPrimaryState?
+  newPrimaryCohort   CohortPrimaryState
+  reason             String
+  actor              User                       @relation("CohortComplianceActionActor", fields: [actorId], references: [id])
+  actorId            String
+  createdAt          DateTime                   @default(now())
+
+  @@index([previousDecisionId])
+}
+
+/// v3.0 §7.3's compliance aging/escalation outcomes — the action a
+/// compliance reviewer actually took, not the automated HOLD/AGING/
+/// ESCALATED sub-states (see CohortComplianceAgingState, which this is
+/// deliberately a separate enum from: that one is computed on read, this
+/// one is a real, CCR/compliance-attested decision).
+enum CohortComplianceActionType {
+  CLEARED
+  DECLINED
+}
+
+// --- BBS Pathway Engine (L5 — Pathway Decision & Recovery Direction Routing) ----
+//
+// Sits strictly between CohortDecision (L4) and BbsPlan (L6 — this
+// codebase's Plan Engine, misnumbered L6 per the spec's own 3+3-level
+// architecture but left as-is to avoid an unrelated rename). Consumes
+// ONLY CohortDecision's + MasterProfile's already-computed output — never
+// recomputes L1-L4 facts, never overrides L4's primary state (spec's own
+// explicit "Does NOT" list, §1). Versioned append-only, exactly like
+// CohortDecision/MasterProfile/BbsPlan.
+
+/// The spec's own unified pathway-confidence vocabulary (§4.2) — a 4th
+/// band (UNRESOLVED, for a null/blocked pathway) beyond Cohort Engine's
+/// own 3-tier CohortConfidenceLevel, so deliberately its own enum rather
+/// than reusing that one (same per-module independently-evolvable-scale
+/// convention CohortConfidenceLevel itself already established against
+/// Master Profile's identical-shaped scale).
+enum PathwayConfidenceLevel {
+  HIGH
+  MEDIUM
+  LOW
+  UNRESOLVED
+}
+
+/// Spec §15's own pathway_status vocabulary, verbatim.
+enum PathwayStatus {
+  READY
+  BLOCKED
+  INSUFFICIENT_DATA
+  SPECIALIST_REVIEW
+  MANUAL_REVIEW
+  OUT_OF_SCOPE
+  NO_SUITABLE_PATHWAY
+  EXPIRED
+  EXPIRED_UNACCEPTED
+}
+
+/// Spec §11's own pathway_variant vocabulary. 90_DAY is PROPOSED —
+/// REQUIRES BUSINESS/LEGAL/CREDIT/RISK SIGN-OFF (§11, its own explicit
+/// banner) — this engine's own rule implementation (see
+/// calculations/ninety-day-variant.ts) never auto-selects it; the value
+/// exists in the schema so a future signed-off rollout doesn't need a
+/// migration, same precedent as Cohort Engine's own R014/stabilisation
+/// coverage PROPOSED fields.
+enum PathwayVariant {
+  STANDARD
+  NINETY_DAY
+}
+
+/// This engine's own pipeline status, following the
+/// MasterProfileStatus/CohortDecisionStatus/BbsPlanGenerationStatus
+/// convention of every module naming its own pipeline enum after itself.
+enum PathwayGenerationStatus {
+  GENERATING
+  COMPLETED
+  FAILED
+}
+
+/// Spec §6.2's own per-rule evaluation vocabulary — deliberately distinct
+/// from Cohort Engine's evaluated/matched boolean pair, since the spec's
+/// own output schema for this module literally names these 4 states.
+enum PathwayEvaluationResult {
+  FIRED
+  NOT_FIRED
+  NOT_EVALUATED
+  UNKNOWN
+}
+
+/// The BBS Pathway Engine's own deterministic routing output — primary
+/// pathway, alternatives, confidence, TTL, and the full audit trail.
+model PathwayDecision {
+  id      String @id @default(cuid())
+  lead    Lead   @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  leadId  String
+  version Int    @default(1)
+
+  status       PathwayGenerationStatus @default(GENERATING)
+  errorMessage String?
+
+  ruleVersion String
+
+  // Captured at generation time — the same source-version staleness
+  // discipline every downstream module in this codebase already uses.
+  sourceCohortDecision            CohortDecision? @relation(fields: [sourceCohortDecisionId], references: [id])
+  sourceCohortDecisionId          String?
+  sourceCohortDecisionVersion     Int?
+  sourceCohortDecisionGeneratedAt DateTime?
+  sourceMasterProfileVersion      Int?
+
+  generatedAt DateTime?
+
+  // §15's own output schema, field-for-field.
+  primaryPathway  CohortPathway?
+  pathwayVariant  PathwayVariant?
+  pathwayStatus   PathwayStatus?
+  blockingReason  String?
+  inheritedBlocks Json?
+
+  // A snapshot of the L4 facts this decision was actually computed from —
+  // never re-derived on read, so a CCR auditing an old PathwayDecision
+  // version sees exactly what L4 said AT THE TIME, even if L4 has since
+  // moved on.
+  l4PrimaryState      CohortPrimaryState?
+  l4PrimaryReasonCode String?
+  l4SecondaryFlags    Json?
+
+  alternatives   Json?
+  sequencingHint Json?
+
+  confidence           PathwayConfidenceLevel?
+  // "MIN_OF_DIMENSIONS" (§4.2 Method A, default) | "WEIGHTED_PROPOSED"
+  // (§4.2 Method B — PROPOSED, requires calibration; never used to
+  // actually compute confidence in this implementation, same PROPOSED
+  // discipline as pathwayVariant above).
+  confidenceMethod     String?
+  dataQualityBand      String?
+  dimensionConfidences Json?
+
+  // Copied from L4 verbatim for display/audit — never recomputed here.
+  capacityBand        CapacityBand?
+  capacityCap         CapacityBand?
+  resolutionCapacity  String?
+  archetype           CohortArchetype?
+  archetypeConfidence String?
+
+  suitabilityConditions Json?
+  customerReasons       Json?
+  internalReasons       Json?
+  unresolvedQuestions   Json?
+  riskFlags             Json?
+  requiredApprovals     Json?
+
+  specialistReviewRequired Boolean @default(false)
+  complianceHold           Boolean @default(false)
+
+  // Only populated when NOT blocked — §10.4's own rule ("Pathway Engine
+  // does not generate next_actions when blocked; it references L4's").
+  nextActions Json?
+
+  pathwayTtlDays        Int?
+  ttlExpiresAt          DateTime?
+  // Live-computed-on-read concept persisted here as the AS-OF-GENERATION
+  // snapshot only (ACTIVE/EXPIRED/EXPIRED_UNACCEPTED/NOT_APPLICABLE) —
+  // the service's own getForLead() re-derives the live value from
+  // ttlExpiresAt + presentedAt/acceptedAt, same "never trust the
+  // persisted snapshot" discipline Cohort Engine's own compliance-aging
+  // state already uses.
+  presentedToCustomerAt DateTime?
+  acceptedAt            DateTime?
+
+  reviewSchedule Json?
+  changeSummary  Json?
+  dataProvenance Json?
+
+  ruleResults PathwayRuleResult[]
+  bbsPlans    BbsPlan[]
+
+  @@unique([leadId, version])
+  @@index([leadId])
+  @@index([sourceCohortDecisionId])
+}
+
+/// One row per P-rule evaluated (P001-P020) — a real, independently-
+/// queryable table, same reasoning as CohortRuleResult.
+model PathwayRuleResult {
+  id           String                  @id @default(cuid())
+  decision     PathwayDecision         @relation(fields: [decisionId], references: [id], onDelete: Cascade)
+  decisionId   String
+  ruleId       String
+  ruleVersion  String
+  evaluation   PathwayEvaluationResult
+  severity     CohortRuleSeverity
+  evidence     Json
+  reason       String
+  sourceFields Json
+
+  @@index([decisionId])
+  @@index([ruleId])
+}
+
+model RecoveryPlan {
+  id                       String         @id @default(cuid())
+  lead                     Lead           @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  leadId                   String
+  cohortDecision           CohortDecision @relation(fields: [cohortDecisionId], references: [id])
+  cohortDecisionId         String
+  planType                 String
+  principalAmount          Decimal        @db.Decimal(14, 2)
+  tenureMonths             Int
+  interestRatePercent      Decimal        @db.Decimal(5, 2)
+  monthlyInstallmentAmount Decimal        @db.Decimal(14, 2)
+  status                   StageStatus    @default(PENDING)
+  ownerCcrId               String?
+  createdAt                DateTime       @default(now())
+  updatedAt                DateTime       @updatedAt
+
+  installments RecoveryPlanInstallment[]
+
+  @@index([leadId])
+}
+
+model RecoveryPlanInstallment {
+  id                String       @id @default(cuid())
+  recoveryPlan      RecoveryPlan @relation(fields: [recoveryPlanId], references: [id], onDelete: Cascade)
+  recoveryPlanId    String
+  installmentNumber Int
+  dueDate           DateTime
+  amount            Decimal      @db.Decimal(14, 2)
+  status            String
+
+  @@index([recoveryPlanId])
+}
+
+// --- BBS Plan Engine (intervention-design layer) ------------------------
+//
+// Strictly downstream of CohortDecision + MasterProfile — consumes ONLY
+// their already-computed output, never raw bureau/bank data, and never
+// re-decides the cohort itself. Deliberately a NEW model family rather
+// than an extension of the dormant RecoveryPlan/RecoveryPlanInstallment
+// pair above: those two are a literal loan/EMI-schedule shape (all four
+// of principalAmount/tenureMonths/interestRatePercent/
+// monthlyInstallmentAmount are NOT NULL) that cannot honestly represent a
+// C4/C5/C6/X1/X2 plan without fabricating loan terms that don't exist.
+// RecoveryPlan stays fully dormant, reserved for a later, narrower
+// "approved disbursement schedule" concept once a C1/C2 plan actually
+// reaches a real loan.
+
+/// The BBS Plan Engine's own deterministic intervention-design output.
+/// Versioned append-only (`@@unique([leadId, version])`), exactly like
+/// MasterProfile/CohortDecision — a new version is created only by an
+/// explicit CCR "Generate"/"Reassess" action or a CCR override, never
+/// silently recomputed, and never overwrites a prior (possibly
+/// CCR-reviewed) row.
+model BbsPlan {
+  id      String @id @default(cuid())
+  lead    Lead   @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  leadId  String
+  version Int    @default(1)
+
+  generationStatus BbsPlanGenerationStatus @default(GENERATING)
+  errorMessage     String?
+
+  // The spec's own 10-value business lifecycle — meaningful only once
+  // generationStatus === COMPLETED. Deliberately a SEPARATE enum from
+  // generationStatus (pipeline status vs. business state) and from the
+  // shared StageStatus (already the pipeline-stage enum used by the
+  // dormant RecoveryPlan.status itself — reusing it here would blur
+  // exactly the boundary this model exists to keep clean).
+  lifecycleStatus BbsPlanLifecycleStatus?
+
+  // The exact Template Registry version this plan was composed under
+  // (see configuration.ts's planEngine block) — a plain, manually-bumped
+  // version string, not a dynamic policy-admin table (no module in this
+  // codebase has ever built one; see this model's own build notes above).
+  templateId      String
+  templateVersion String
+
+  // The one real precondition for generate(): the source CohortDecision
+  // must be COMPLETED and not stale. Captured at generation time — the
+  // same staleness-detection discipline CohortDecision/MasterProfile
+  // already use.
+  sourceCohortDecision             CohortDecision?  @relation(fields: [sourceCohortDecisionId], references: [id])
+  sourceCohortDecisionId           String?
+  sourceCohortDecisionVersion      Int?
+  sourceCohortDecisionGeneratedAt  DateTime?
+  sourceMasterProfileVersion       Int?
+  // BBS Pathway Engine v3.0 (L5) handoff — additive. Nullable so a plan
+  // generated before the Pathway Engine existed (or for a lead whose
+  // latest Pathway Decision isn't COMPLETED) still has an honest "not
+  // available" rather than a backfilled/fabricated value.
+  sourcePathwayDecision            PathwayDecision? @relation(fields: [sourcePathwayDecisionId], references: [id])
+  sourcePathwayDecisionId          String?
+  sourcePathwayDecisionVersion     Int?
+  sourcePathwayDecisionGeneratedAt DateTime?
+
+  generatedAt DateTime?
+
+  // Copied from the source CohortDecision at generation time — nullable
+  // to mirror Cohort Engine's own nullable cohort/pathway states (X1/X2/
+  // C6/CONSENT_PENDING/KYC_PENDING/MANUAL_REVIEW/CUSTOMER_UNRESPONSIVE
+  // all still produce a real, thinner plan via the Template Registry's
+  // own routing — generation is never refused based on which cohort was
+  // decided, only when the Cohort Decision itself isn't COMPLETED/stale).
+  cohort  CohortPrimaryState?
+  pathway CohortPathway?
+
+  // Deterministic plan composition output — bounded Json, same
+  // convention as CohortDecision's own secondaryFlags/missingData/
+  // dataProvenance (everything without an independent per-row lifecycle
+  // stays Json; BbsPlanAction/BbsPlanCondition below are the two
+  // exceptions, for the same reason CohortRuleResult is a real table).
+  situationAssessment Json?
+  problemDefinition   Json?
+  financialCapacity   Json?
+  debtStrategy        Json?
+  financialTargets    Json?
+  debtTargets         Json?
+  risks               Json?
+  disclosures         Json?
+  successCriteria     Json?
+  monitoringTriggers  Json?
+  reviewSchedule      Json?
+  dataProvenance      Json?
+  missingData         Json?
+  customerExplanation String?
+
+  specialistReviewRequired Boolean @default(false)
+
+  // v3.0 §19.3/§19.6 — a best-effort, field-level diff against the prior
+  // version (pathway/cohort/template/target changes + a LOW/MEDIUM/HIGH
+  // materiality flag), populated on reassess()/override(). Null for a
+  // lead's first version (nothing to diff against).
+  changeSummary Json?
+
+  // v3.0 §7 rule-catalog results (PL001/PL004/PL005/PL007-PL010/
+  // PL013-PL015) — kept as one Json array (not a child table like
+  // CohortRuleResult/PathwayRuleResult) since no per-row lifecycle is
+  // needed: these never change after generation.
+  ruleResults Json?
+
+  // v3.0 §12.5 — fixed per-pathway TTL (days), computed live at read time
+  // into an EXPIRED status rather than an actually-scheduled transition
+  // (no scheduler/job-queue infrastructure exists anywhere in this
+  // codebase, same discipline as Pathway Engine's own TTL model).
+  planTtlDays  Int?
+  ttlExpiresAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  actions       BbsPlanAction[]
+  conditions    BbsPlanCondition[]
+  overridesFrom BbsPlanOverride[]  @relation("PreviousPlan")
+  overridesTo   BbsPlanOverride[]  @relation("NewPlan")
+
+  @@unique([leadId, version])
+  @@index([leadId])
+  @@index([sourceCohortDecisionId])
+  @@index([sourcePathwayDecisionId])
+}
+
+/// The BBS Plan Engine's own pipeline status — a bespoke enum (not the
+/// shared StageStatus, not BbsPlanLifecycleStatus), following the
+/// MasterProfileStatus/CohortDecisionStatus convention of every module
+/// naming its own pipeline enum after itself.
+enum BbsPlanGenerationStatus {
+  GENERATING
+  COMPLETED
+  FAILED
+}
+
+/// The spec's own business-lifecycle vocabulary, verbatim. There is no
+/// automated transition between any two of these states (e.g.
+/// EXECUTION_READY -> ACTIVE) — no scheduler/job-queue infrastructure
+/// exists anywhere in this codebase, so every transition is an explicit,
+/// CCR-driven action.
+enum BbsPlanLifecycleStatus {
+  DRAFT
+  CCR_REVIEW
+  SPECIALIST_REVIEW
+  CUSTOMER_ACCEPTANCE_PENDING
+  EXECUTION_READY
+  ACTIVE
+  PAUSED
+  REASSESSMENT_REQUIRED
+  COMPLETED
+  CANCELLED
+}
+
+/// One row per action in a generated plan's phased action list (Immediate/
+/// Day 30/60/90) — a real, independently-queryable table, same reasoning
+/// as CohortRuleResult/MasterProfileReconciliationRow: a CCR needs to flip
+/// one action's status without a read-modify-write race on a Json blob
+/// touched by multiple actors (customer/BBS/creditor-owned actions are
+/// updated independently, at different times, by different people).
+model BbsPlanAction {
+  id               String              @id @default(cuid())
+  plan             BbsPlan             @relation(fields: [planId], references: [id], onDelete: Cascade)
+  planId           String
+  actionId         String // e.g. "immediate-1", or a canonical Action Library ID like "CA-001"
+  ownerType        BbsPlanActionOwner
+  phase            BbsPlanActionPhase
+  description      String
+  owner            String
+  timing           String
+  dependency       String?
+  evidenceRequired Json?
+  // v3.0 §11.2 — was a free, never-transitioned String; now a real,
+  // DB-enforced state machine (see PlanEngineService.updateActionStatus()
+  // for the legal-transition table). Existing "PENDING" rows remain valid.
+  status           BbsPlanActionStatus @default(PENDING)
+  // v3.0 §10.4 — populated from the Action Library's own SLA table for
+  // canonical actions; null for template-authored, plan-specific actions
+  // (those carry a prose `timing` instead, e.g. "Day 60 review").
+  slaDays          Int?
+
+  @@index([planId])
+}
+
+enum BbsPlanActionOwner {
+  CUSTOMER
+  BBS
+  CREDITOR
+}
+
+enum BbsPlanActionPhase {
+  IMMEDIATE
+  DAY_30
+  DAY_60
+  DAY_90
+}
+
+/// v3.0 §11.2, verbatim. No automated transition exists between any two
+/// of these (no scheduler infra) — every change is an explicit CCR/
+/// customer/BBS-recorded action via PlanEngineService.updateActionStatus().
+enum BbsPlanActionStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETE
+  BLOCKED
+  FAILED
+  CANCELLED
+  ESCALATED
+}
+
+/// One row per plan condition (e.g. "lender approves consolidation") — a
+/// real table for the identical reason BbsPlanAction is: a CCR needs to
+/// independently flip one condition's state/verificationStatus without a
+/// blob-level race, and needs to query across rows (e.g. "all UNVERIFIED
+/// conditions in my book").
+model BbsPlanCondition {
+  id                 String                @id @default(cuid())
+  plan               BbsPlan               @relation(fields: [planId], references: [id], onDelete: Cascade)
+  planId             String
+  conditionId        String
+  description        String
+  state              BbsPlanConditionState @default(UNKNOWN)
+  source             String
+  verificationStatus String                @default("UNVERIFIED")
+  // v3.0 §13.2 condition lifecycle fields — all additive/nullable. Plan
+  // Engine only ever verifies conditions it can honestly evaluate itself
+  // (consent/KYC/compliance/P1, already gated upstream); product/lender
+  // conditions stay NOT_APPLICABLE, same no-live-integration discipline
+  // Pathway Engine already uses for P011/P012.
+  verifiedBy           User?     @relation("BbsPlanConditionVerifiedBy", fields: [verifiedById], references: [id])
+  verifiedById         String?
+  verificationEvidence String?
+  escalationPath       String?
+  priority             String? // "P1" | "P2" | "P3", per v3.0 §13.4's standard-conditions table
+
+  @@index([planId])
+}
+
+enum BbsPlanConditionState {
+  MET
+  PENDING
+  FAILED
+  NOT_APPLICABLE
+  UNKNOWN
+}
+
+/// A CCR/supervisor override of an algorithmically-generated plan's
+/// lifecycle status or template. Never mutates the original plan — it
+/// creates a NEW BbsPlan version and links both ends here, mirroring
+/// CohortOverride exactly ("do not overwrite historical decisions").
+model BbsPlanOverride {
+  id                 String                  @id @default(cuid())
+  // Restrict, not Cascade — same reasoning as CohortOverride's own FKs above.
+  previousPlan       BbsPlan                 @relation("PreviousPlan", fields: [previousPlanId], references: [id], onDelete: Restrict)
+  previousPlanId     String
+  newPlan            BbsPlan                 @relation("NewPlan", fields: [newPlanId], references: [id], onDelete: Restrict)
+  newPlanId          String                  @unique
+  oldLifecycleStatus BbsPlanLifecycleStatus?
+  newLifecycleStatus BbsPlanLifecycleStatus
+  reason             String
+  actor              User                    @relation("BbsPlanOverrideActor", fields: [actorId], references: [id])
+  actorId            String
+  approver           User?                   @relation("BbsPlanOverrideApprover", fields: [approverId], references: [id])
+  approverId         String?
+  createdAt          DateTime                @default(now())
+
+  @@index([previousPlanId])
+}
+
+// --- Master Profile (synthesis layer) -----------------------------------
+//
+// Reconciles BBS Debt Analysis + BBS Financial Analysis into one
+// evidence-based profile for the (not yet built) Cohort Engine. Never
+// reparses a credit report or bank statement, and never recalculates a
+// ratio/score either sibling module already computed — this layer only
+// compares, reconciles and interprets their already-persisted outputs.
+// Versioned append-only (`@@unique([leadId, version])`), exactly like
+// CustomerProfile — a new version is created only by an explicit CCR
+// "Generate"/"Regenerate" action, never silently recomputed on every tab
+// open (the spec's own explicit instruction not to call the AI provider on
+// every view). `cohortAttributes` below is exposed for a future Cohort
+// Engine to consume — this build never writes to CohortDecision itself.
+
+model MasterProfile {
+  id      String @id @default(cuid())
+  lead    Lead   @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  leadId  String
+  version Int    @default(1)
+
+  status       MasterProfileStatus @default(GENERATING)
+  errorMessage String?
+
+  // Captured at generation time — compared against the CURRENT live
+  // CreditReport/BankStatementAnalysis rows on every GET to detect
+  // staleness (source data reprocessed since this profile was generated)
+  // without silently re-running anything. BankStatementAnalysis is NOT
+  // unique per lead (a lead may re-upload a corrected statement), so the
+  // "latest" one is always resolved the same way FinancialAnalysisService
+  // itself does: findFirst ordered by createdAt desc.
+  sourceCreditReportId           String?
+  sourceCreditReportCompletedAt  DateTime?
+  sourceBankStatementAnalysisId  String?
+  sourceBankStatementCompletedAt DateTime?
+
+  generatedAt    DateTime?
+  aiProvider     AiProvider?
+  aiModelVersion String?
+
+  // BBS Master Profile Module v3.0 §13.1's three separate as-of-date
+  // fields — `generatedAt` above is "when L3 was produced," genuinely
+  // distinct from WHEN the underlying L1/L2 data itself is as-of (the
+  // bureau pull date and the bank statement's own period-end date). Not to
+  // be confused with sourceCreditReportCompletedAt/
+  // sourceBankStatementCompletedAt above, which track when THIS APP finished
+  // processing that source — l1DataAsOf/l2DataAsOf are the source data's own
+  // stated date (CreditReport.pulledAt, BankStatementAnalysis statement
+  // period end).
+  l1DataAsOf DateTime?
+  l2DataAsOf DateTime?
+
+  // v3.0 §4.4 — replaces a numeric DQ score entirely with a qualitative
+  // band + explicit flag list (§4.4.3: a numeric score "hid more than it
+  // revealed"). dataQualityFlags is a string array of flag codes from
+  // §4.4.2's inherited-plus-L3-specific vocabulary.
+  dataQualityBand  MasterDataQualityBand?
+  dataQualityFlags Json?
+
+  // v3.0 §14 — compliance routing. Always complianceHold=false unless a
+  // related-party employer or other compliance trigger fires; when true,
+  // this supersedes every other alignmentState per §12.3.
+  complianceHold              Boolean   @default(false)
+  complianceHoldReason        String?
+  complianceHoldMatchedEntity String?
+  complianceHoldSince         DateTime?
+  complianceSlaHours          Int?
+  complianceEscalationHours   Int?
+
+  // v3.0 §4.4.2 (L3-specific subset) / §14.4 — every active exception state
+  // this profile is currently carrying, independent of the DQ-flag list
+  // above (exceptions include non-DQ states too, e.g. L1_DEBT_POST_STATEMENT,
+  // SINGLE_SNAPSHOT). §14.4's own exception-count threshold (>=5 ->
+  // specialist review) reads the length of this list.
+  exceptionStates Json?
+
+  // v3.0 §22 — the Readiness Gate (R1-R8) and its routed outcome. Computed
+  // fresh on every generate(), never cached independently of the profile
+  // version it belongs to.
+  readinessOutcome    ReadinessOutcome?
+  readinessConditions Json?
+
+  // v3.0 §5.7 — L1 debt opened after the L2 statement period ended cannot
+  // have its repayment behaviour assessed from the current statement.
+  postStatementDebt Json?
+
+  // v3.0 §9.2 — inferred family/P2P network entries reframed for capacity
+  // purposes, each starting UNVERIFIED (see buildFamilyNetworkVerification).
+  familyNetworkVerification Json?
+
+  // v3.0 §4.2 — "No single overall confidence... report per-dimension
+  // confidence." overallConfidence below is retained for backward read
+  // compatibility with older persisted versions, but new generations treat
+  // dimensionConfidences (one HIGH/MEDIUM/LOW per v3.0 §7's 5 named
+  // dimensions) as the primary confidence surface.
+  dimensionConfidences Json?
+
+  // Deterministic conclusions only — never AI-authored. The AI contract
+  // (MasterProfileAssessmentFindings) narrates these but never sets them.
+  alignmentState      CreditFinancialAlignmentState?
+  resolutionCapacity  ResolutionCapacityLevel?
+  overallConfidence   MasterConfidenceLevel?
+  bureauDsrPercent    Float?
+  bankDsrPercent      Float?
+  masterDsrPercent    Float?
+  financialTrajectory FinancialTrajectory            @default(UNKNOWN)
+
+  // Bounded, non-independently-queried nested data — the same Json
+  // convention CustomerProfile.stabilityIndicators /
+  // BankStatementAnalysis.parserWarnings already use in this schema.
+  // Deliberately NO separate credit/debt/income/cashFlow/liquidity
+  // "snapshot" copy here — the spec's own Part 7 instruction ("do not
+  // duplicate the entire Debt Analysis page; show the key facts and
+  // provide drill-down") means the frontend reads those directly from
+  // GET /leads/:bbsLeadId/debt-analysis and /financial-analysis, never a
+  // third persisted copy. Likewise no separate AI-narrative column: the
+  // full AI findings already live in AnalysisResult, read the same way
+  // Debt/Financial Analysis's own `insights` field already does.
+  // "Key Contradictions" (spec Part 16) is deliberately NOT a deterministic
+  // column here — it is one of the spec's own AI-narrative layers, so it
+  // lives only in the AI findings (AnalysisResult), read the same way the
+  // fields below already are.
+  identitySnapshot   Json?
+  stressProfile      Json?
+  strengths          Json?
+  concerns           Json?
+  opportunitySignals Json?
+  possibleCauses     Json?
+  validationRequired Json?
+  cohortAttributes   Json?
+
+  createdAt DateTime @default(now())
+
+  reconciliationRows MasterProfileReconciliationRow[]
+  missingInformation MasterMissingInformationItem[]
+
+  @@unique([leadId, version])
+  @@index([leadId])
+}
+
+/// BBS Master Profile Module v3.0 §20's consolidated, prioritized Missing
+/// Information Register — a real child table (not a Json list) for the same
+/// reason MasterProfileReconciliationRow already is: a CCR needs to mark one
+/// item `resolved` independently without a read-modify-write race on a blob
+/// touched by multiple actors.
+model MasterMissingInformationItem {
+  id              String        @id @default(cuid())
+  masterProfile   MasterProfile @relation(fields: [masterProfileId], references: [id], onDelete: Cascade)
+  masterProfileId String
+
+  itemText     String
+  sourceModule String // "L1" | "L2" | "L1+L2" — free text per §20.3's own notation, not an enum (new source combinations are plausible, e.g. a future L3-only item)
+  priority     MirPriority
+  resolved     Boolean     @default(false)
+
+  @@index([masterProfileId])
+}
+
+/// One row per in-scope credit account or unmatched bank-observed recurring
+/// debt payment — a real, sortable table (not folded into the Json columns
+/// above) because the spec explicitly wants a clickable, per-lender
+/// reconciliation table with its own evidence drawer (Part 13/35), the same
+/// reasoning that already justified NormalizedTransaction/FinancialRiskFlag
+/// as real tables elsewhere in this schema.
+model MasterProfileReconciliationRow {
+  id              String        @id @default(cuid())
+  masterProfile   MasterProfile @relation(fields: [masterProfileId], references: [id], onDelete: Cascade)
+  masterProfileId String
+
+  lender                  String
+  product                 String?
+  reportedOutstanding     Decimal?                 @db.Decimal(14, 2)
+  reportedEmi             Decimal?                 @db.Decimal(14, 2)
+  observedPayment         Decimal?                 @db.Decimal(14, 2)
+  observedFrequencyMonths Int?
+  matchStatus             ReconciliationMatchState
+  confidence              Float?
+  explanation             String
+
+  @@index([masterProfileId])
+}
+
+/// Append-only audit trail for sensitive operations (login, lead
+/// assignment, document access, assessment overrides, ...). Never updated
+/// or deleted in normal operation.
+model AuditLog {
+  id         String   @id @default(cuid())
+  actor      User?    @relation(fields: [actorId], references: [id])
+  actorId    String?
+  lead       Lead?    @relation(fields: [leadId], references: [id])
+  leadId     String?
+  action     String
+  entityType String?
+  entityId   String?
+  metadata   Json?
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+
+  @@index([actorId])
+  @@index([leadId])
+  @@index([action])
+}
