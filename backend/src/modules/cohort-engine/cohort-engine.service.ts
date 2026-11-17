@@ -486,7 +486,11 @@ export class CohortEngineService {
     // MasterProfile.getForLead() itself already uses — never a silent
     // background recompute.
     const currentMasterProfile = await this.masterProfileService.getForLead(bbsLeadId)
-    const isStale = currentMasterProfile.profileAvailable && currentMasterProfile.status === 'COMPLETED' && currentMasterProfile.version !== decision.sourceMasterProfileVersion
+    // A decision a person set by override is pinned: it is never stale because Master Profile regenerated, since the
+    // override is a human judgement made on top of whatever data existed, and re-running the rules would silently
+    // discard it. It changes only when someone explicitly overrides again or re-evaluates.
+    const isOverride = (await this.prisma.cohortOverride.count({ where: { newDecisionId: decision.id } })) > 0
+    const isStale = !isOverride && currentMasterProfile.profileAvailable && currentMasterProfile.status === 'COMPLETED' && currentMasterProfile.version !== decision.sourceMasterProfileVersion
 
     const { primaryState, primaryReasonCode } = decision.primaryCohort ? toPrimaryStateAndReasonCode(decision.primaryCohort) : { primaryState: null, primaryReasonCode: null }
 
@@ -669,6 +673,9 @@ export class CohortEngineService {
           confidence: previous.confidence,
           dataProvenance: previous.dataProvenance ?? undefined,
           consentVersion: previous.consentVersion,
+          // Keep the basis of the decision being overridden (it used to be left empty, which made every override look stale).
+          sourceMasterProfileVersion: previous.sourceMasterProfileVersion,
+          sourceMasterProfileGeneratedAt: previous.sourceMasterProfileGeneratedAt,
         },
       }),
     ])

@@ -1364,6 +1364,8 @@ export interface MasterMissingInformationItem {
   sourceModule: string
   priority: MirPriority
   resolved?: boolean
+  /** 'CCR_DECLARED' = the CCR recorded an answer for it (unverified customer statement). */
+  resolutionSource?: string | null
 }
 
 export type MasterDimensionName = 'IDENTITY_COMPLIANCE' | 'CREDIT_HEALTH' | 'INCOME_CASH_FLOW' | 'DEBT_LIQUIDITY' | 'ALIGNMENT_CAPACITY'
@@ -1508,7 +1510,9 @@ export interface MasterProfileAssessmentFindings {
 }
 
 export interface MasterProfileInsights {
-  status: 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED'
+  /** TIMED_OUT = the job was still QUEUED/RUNNING long past the AI timeout, so it is no longer in flight. */
+  status: 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'TIMED_OUT'
+  errorMessage?: string | null
   findings?: MasterProfileAssessmentFindings
   confidence?: number | null
   modelVersion?: string
@@ -2024,4 +2028,101 @@ export interface CreateLeadRecordInput {
   pan?: string
   creditScore?: number
   totalOverdue?: number
+}
+
+// --- CCR interaction (L1/L2 verification Q&A) -------------------------------
+
+export type CcrQuestionSource = 'L1_DEBT_ANALYSIS' | 'L2_FINANCIAL_ANALYSIS' | 'MASTER_PROFILE'
+export type CcrAnswerType = 'TEXT' | 'AMOUNT' | 'YES_NO'
+export type CcrResponseStatus = 'ANSWERED' | 'CUSTOMER_DECLINED' | 'NOT_KNOWN'
+
+export interface CcrSavedAnswer {
+  responseStatus: CcrResponseStatus
+  answerText: string | null
+  answerAmount: number | null
+  answerBoolean: boolean | null
+  /** Set when submit copied this answer onto a profile field. */
+  appliedTo: string | null
+  /** Set when submit found the answer conflicted with an existing value and kept the existing one. */
+  conflictNote: string | null
+  answeredAt: string
+}
+
+export interface CcrQuestionItem {
+  key: string
+  source: CcrQuestionSource
+  text: string
+  answerType: CcrAnswerType
+  fieldKey: string | null
+  answer: CcrSavedAnswer | null
+}
+
+export interface CcrInteractionState {
+  bbsLeadId: string
+  questionsAvailable: boolean
+  unavailableReason: string | null
+  status: 'DRAFT' | 'SUBMITTED'
+  submittedAt: string | null
+  progress: { total: number; answered: number; remaining: number }
+  canSubmit: boolean
+  questions: CcrQuestionItem[]
+  /** Answers recorded for a question the lead's analyses no longer generate. */
+  retiredAnswers: Array<CcrSavedAnswer & { questionKey: string; source: string; questionText: string }>
+}
+
+export interface CcrAnswerInput {
+  questionKey: string
+  responseStatus: CcrResponseStatus
+  answerText?: string
+  answerAmount?: number
+  answerBoolean?: boolean
+}
+
+export interface CcrSubmitResult extends CcrInteractionState {
+  downstream: {
+    applied: Array<{ fieldKey: string; appliedTo: string | null; conflictNote: string | null }>
+    masterProfile: { generated: boolean; reason?: string }
+    /** null when the Master Profile could not be regenerated. */
+    recalculated: null | Record<'cohort' | 'pathway' | 'plan', { generated: boolean; reason?: string } | { skipped: true; reason: string }>
+  }
+}
+
+// --- Data requirements (what a blocked lead still needs) ----------------------
+
+export type DataRequirementActionType = 'UPLOAD_BANK_STATEMENT' | 'ANSWER_CCR_QUESTIONS' | 'SUPERVISOR_REVIEW' | 'NONE'
+
+export interface DataRequirement {
+  code: string
+  severity: 'BLOCKING' | 'IMPROVES'
+  title: string
+  why: string
+  action: { type: DataRequirementActionType; label: string }
+  detail?: { needed?: string; fixableByNewStatement?: string[]; structural?: string[]; reflectTransactions?: string[] } & Record<string, unknown>
+}
+
+export interface BlockExplanation {
+  code: string
+  title: string
+  meaning: string
+  whyThisLead: string[]
+  whatToDo: string[]
+  whoCanClear: string
+  /** Secondary matches — NOT extra blockers; where the case would likely go once cleared. */
+  alsoMatched: Array<{ code: string; label: string }>
+}
+
+export interface DataRequirementsResponse {
+  blockExplanation: BlockExplanation | null
+  requirements: DataRequirement[]
+  blocked: boolean
+  headline: string | null
+  profileAvailable: boolean
+}
+
+export type StageRecalcOutcome = { generated: boolean; reason?: string } | { skipped: true; reason: string }
+
+export interface RecalculateAllResult {
+  masterProfile: { generated: boolean; reason?: string }
+  stages: Record<'cohort' | 'pathway' | 'plan', StageRecalcOutcome> | null
+  requirements: DataRequirementsResponse
 }

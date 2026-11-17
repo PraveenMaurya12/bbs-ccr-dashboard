@@ -1,5 +1,16 @@
 import type { DataQualityResult } from '../master-profile.types'
 
+/** L2 risk-flag keys that genuinely describe the quality/completeness of the data (v3.0 §4.4.2's inherited-from-L2 list, plus L2's own incompleteness flags). */
+export const L2_DATA_QUALITY_FLAGS: ReadonlySet<string> = new Set([
+  'FCF_UNRECONCILED',
+  'OTHER_ACCOUNTS_LIKELY',
+  'BUSINESS_PERSONAL_MIXED',
+  'UNCLASSIFIED_TRANSACTIONS',
+  'RECONCILIATION_FAILED',
+  'DATA_INCOMPLETE',
+  'LOW_CLASSIFICATION_CONFIDENCE',
+])
+
 /**
  * BBS Master Profile Module v3.0 §4.4 — replaces a numeric composite Data
  * Quality score entirely with a qualitative band plus an explicit flag
@@ -18,7 +29,11 @@ import type { DataQualityResult } from '../master-profile.types'
  * subset and silently dropping real signal.
  */
 export function computeDataQualityBand(l1DqTotal: number | null, l2DqTotal: number | null, l1FlagCodes: string[], l2FlagCodes: string[], l3Flags: string[]): DataQualityResult {
-  const flags = [...new Set([...l1FlagCodes, ...l2FlagCodes, ...l3Flags])]
+  // Only L2's genuine data-quality signals count. Its other risk flags describe the customer's financial BEHAVIOUR
+  // (low liquidity, UPI-heavy, a medical spend...) or are even positive (INCOME_STABLE) — counting them as "data
+  // quality" meant the more financially stressed the customer, the lower the data quality, which pushed exactly the
+  // customers who need help into X1 (insufficient data).
+  const flags = [...new Set([...l1FlagCodes, ...l2FlagCodes.filter((f) => L2_DATA_QUALITY_FLAGS.has(f)), ...l3Flags])]
 
   if (l1DqTotal === null || l2DqTotal === null) {
     return { band: 'INSUFFICIENT', flags }

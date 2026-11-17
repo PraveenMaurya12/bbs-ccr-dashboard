@@ -420,6 +420,7 @@ model Lead {
   recoveryPlans         RecoveryPlan[]
   bbsPlans              BbsPlan[]
   auditLogs             AuditLog[]
+  ccrInteraction        CcrInteraction?
 
   @@index([assignedCcrId])
   @@index([city])
@@ -1942,20 +1943,20 @@ enum BbsPlanActionStatus {
 /// blob-level race, and needs to query across rows (e.g. "all UNVERIFIED
 /// conditions in my book").
 model BbsPlanCondition {
-  id                 String                @id @default(cuid())
-  plan               BbsPlan               @relation(fields: [planId], references: [id], onDelete: Cascade)
-  planId             String
-  conditionId        String
-  description        String
-  state              BbsPlanConditionState @default(UNKNOWN)
-  source             String
-  verificationStatus String                @default("UNVERIFIED")
+  id                   String                @id @default(cuid())
+  plan                 BbsPlan               @relation(fields: [planId], references: [id], onDelete: Cascade)
+  planId               String
+  conditionId          String
+  description          String
+  state                BbsPlanConditionState @default(UNKNOWN)
+  source               String
+  verificationStatus   String                @default("UNVERIFIED")
   // v3.0 §13.2 condition lifecycle fields — all additive/nullable. Plan
   // Engine only ever verifies conditions it can honestly evaluate itself
   // (consent/KYC/compliance/P1, already gated upstream); product/lender
   // conditions stay NOT_APPLICABLE, same no-live-integration discipline
   // Pathway Engine already uses for P011/P012.
-  verifiedBy           User?     @relation("BbsPlanConditionVerifiedBy", fields: [verifiedById], references: [id])
+  verifiedBy           User?                 @relation("BbsPlanConditionVerifiedBy", fields: [verifiedById], references: [id])
   verifiedById         String?
   verificationEvidence String?
   escalationPath       String?
@@ -2144,10 +2145,12 @@ model MasterMissingInformationItem {
   masterProfile   MasterProfile @relation(fields: [masterProfileId], references: [id], onDelete: Cascade)
   masterProfileId String
 
-  itemText     String
-  sourceModule String // "L1" | "L2" | "L1+L2" — free text per §20.3's own notation, not an enum (new source combinations are plausible, e.g. a future L3-only item)
-  priority     MirPriority
-  resolved     Boolean     @default(false)
+  itemText         String
+  sourceModule     String // "L1" | "L2" | "L1+L2" — free text per §20.3's own notation, not an enum (new source combinations are plausible, e.g. a future L3-only item)
+  priority         MirPriority
+  resolved         Boolean     @default(false)
+  /// Who/what resolved this item. Only 'CCR_DECLARED' today: the CCR recorded an answer for it (an unverified customer statement — it clears the CCR-first gate but does not make the underlying fact verified).
+  resolutionSource String?
 
   @@index([masterProfileId])
 }
@@ -2195,4 +2198,74 @@ model AuditLog {
   @@index([actorId])
   @@index([leadId])
   @@index([action])
+}
+
+// --- CCR interaction (L1/L2 verification Q&A) ---------------------------
+//
+// The questions themselves are NOT stored: they are generated live and
+// deterministically from the lead's L1 Debt Analysis discovery agenda and
+// L2 Financial Analysis CCR brief (see CcrInteractionService). What IS
+// persisted is the CCR's own answer to each one, keyed by a stable hash of
+// the question's source + text, so an answer is always tied to exactly one
+// lead and one question. A question that stops being generated (e.g. the
+// underlying data changed) leaves its answer behind as a "retired" row
+// rather than silently dropping what the CCR recorded.
+
+enum CcrInteractionStatus {
+  DRAFT
+  SUBMITTED
+}
+
+/// How the customer responded to a question. UNKNOWN/DECLINED are first-class
+/// outcomes so a CCR can complete an interaction without inventing an answer.
+enum CcrResponseStatus {
+  ANSWERED
+  CUSTOMER_DECLINED
+  NOT_KNOWN
+}
+
+/// One interaction per lead: the container whose DRAFT -> SUBMITTED lifecycle
+/// gates downstream recalculation. Editing an answer after submission
+/// reopens it to DRAFT so the downstream engines are never fed stale answers.
+model CcrInteraction {
+  id            String               @id @default(cuid())
+  lead          Lead                 @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  leadId        String               @unique
+  status        CcrInteractionStatus @default(DRAFT)
+  submittedAt   DateTime?
+  submittedById String?
+  createdAt     DateTime             @default(now())
+  updatedAt     DateTime             @updatedAt
+
+  answers CcrAnswer[]
+}
+
+model CcrAnswer {
+  id             String            @id @default(cuid())
+  interaction    CcrInteraction    @relation(fields: [interactionId], references: [id], onDelete: Cascade)
+  interactionId  String
+  // Denormalised so the (leadId, questionKey) uniqueness below is a real
+  // database-level guarantee that one question has one answer per lead.
+  leadId         String
+  questionKey    String
+  source         String // 'L1_DEBT_ANALYSIS' | 'L2_FINANCIAL_ANALYSIS'
+  // Snapshot of the question as the CCR saw it — kept so a retired answer
+  // remains readable after the question stops being generated.
+  questionText   String
+  // Non-null only for the structured questions whose answer feeds a profile field.
+  fieldKey       String?
+  responseStatus CcrResponseStatus
+  answerText     String?
+  answerAmount   Decimal?          @db.Decimal(14, 2)
+  answerBoolean  Boolean?
+  // Set when submit mapped this answer onto a profile field, or recorded that
+  // it conflicted with an existing value instead of overwriting it.
+  appliedTo      String?
+  conflictNote   String?
+  answeredById   String
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  @@unique([leadId, questionKey])
+  @@index([interactionId])
 }

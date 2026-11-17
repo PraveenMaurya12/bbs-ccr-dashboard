@@ -14,6 +14,9 @@ import { buildFamilyNetworkVerification } from './calculations/family-network-ve
 import { buildMissingInformationRegister } from './calculations/missing-information-register'
 import { detectPostStatementDebt } from './calculations/post-statement-debt'
 import { evaluateReadinessGate } from './calculations/readiness-gate'
+import { effectiveJobStatus } from '@/modules/analysis/job-status'
+import { applyCcrResolutions } from './calculations/ccr-resolution'
+import { compareCcrDeclared, type CcrDeclaredFacts } from './calculations/ccr-declared'
 import { assessValidationRequired, detectPossibleCauses, detectStrengthsConcernsOpportunities } from './calculations/signals'
 import { compareDebtServicing } from './calculations/debt-servicing'
 import { detectDateAlignment } from './calculations/date-alignment'
@@ -282,9 +285,21 @@ export class MasterProfileService {
       const cohortAttributes = buildCohortAttributeVector(debtFacts, financialFacts.months, dsrComparison, stressProfile, alignmentState, resolutionCapacityResult.level, overallConfidence)
       const { strengths, concerns, opportunitySignals } = detectStrengthsConcernsOpportunities(debtFacts, financialFacts.months, dsrComparison, reconciliationRows)
       const possibleCauses = detectPossibleCauses(debtFacts, financialFacts.months)
-      const validationRequired = assessValidationRequired(dsrComparison, reconciliationRows)
-      const missingInformation = buildMissingInformationRegister(debtFacts.missingInformationItems, financialFacts.missingInformationItems, complianceRouting, postStatementDebt, familyNetworkVerification)
-      const p1Count = missingInformation.filter((i) => i.priority === 'P1').length
+      // CCR-declared answers (submitted L1/L2 interaction) are compared against the observed
+      // figures and surfaced as validation items — never substituted for them.
+      const ccrDeclared = await this.loadCcrDeclared(lead.id)
+      const validationRequired = [
+        ...assessValidationRequired(dsrComparison, reconciliationRows),
+        ...(ccrDeclared ? compareCcrDeclared(ccrDeclared, { avgMonthlyIncome, avgEssentialExpenses: financialFacts.months.length > 0 ? avgEssentialExpenses : null, bureauMonthlyEmi: debtFacts.monthlyEmi }) : []),
+      ]
+      // Items the CCR has answered (in a SUBMITTED interaction) are resolved; the register is rebuilt on every
+      // generation, so this is recomputed from the persisted answers each time rather than stored once.
+      const missingInformation = applyCcrResolutions(
+        buildMissingInformationRegister(debtFacts.missingInformationItems, financialFacts.missingInformationItems, complianceRouting, postStatementDebt, familyNetworkVerification),
+        await this.loadSubmittedCcrAnswers(lead.id),
+      )
+      // Only UNRESOLVED P1 items hold the lead at the CCR-first gate.
+      const p1Count = missingInformation.filter((i) => i.priority === 'P1' && !i.resolved).length
       const readinessGate = evaluateReadinessGate(true, dataQuality.band, l3Flags.length, complianceRouting, p1Count, true)
 
       const masterProfileFacts = {
@@ -306,6 +321,7 @@ export class MasterProfileService {
         opportunitySignals,
         possibleCauses,
         validationRequired,
+        ccrDeclared,
         missingInformation,
         cohortAttributes,
       }
@@ -328,7 +344,7 @@ export class MasterProfileService {
         }),
         this.prisma.masterMissingInformationItem.deleteMany({ where: { masterProfileId: profile.id } }),
         this.prisma.masterMissingInformationItem.createMany({
-          data: missingInformation.map((i) => ({ masterProfileId: profile.id, itemText: i.itemText, sourceModule: i.sourceModule, priority: i.priority })),
+          data: missingInformation.map((i) => ({ masterProfileId: profile.id, itemText: i.itemText, sourceModule: i.sourceModule, priority: i.priority, resolved: i.resolved, resolutionSource: i.resolutionSource })),
         }),
         this.prisma.masterProfile.update({
           where: { id: profile.id },
@@ -377,7 +393,7 @@ export class MasterProfileService {
 
       // Best-effort: advisory AI synthesis never re-triggers generation on failure.
       await this.analysisService
-        .createAndRun({ bbsLeadId, jobType: 'MASTER_PROFILE_INSIGHTS', payload: { masterProfileFacts } })
+        .createAndRun({ bbsLeadId, jobType: 'MASTER_PROFILE_INSIGHTS', payload: { masterProfileFacts, profileVersion: version } })
         .catch((error) => {
           this.log('INSIGHTS_JOB_FAILED_TO_START', { bbsLeadId, error: error instanceof Error ? error.message : String(error) })
         })
@@ -388,6 +404,28 @@ export class MasterProfileService {
       await this.prisma.masterProfile.update({ where: { id: profile.id }, data: { status: 'FAILED', errorMessage: message } })
       this.log('PROFILE_FAILED', { bbsLeadId, profileId: profile.id, error: message })
       return { generated: false, reason: message }
+    }
+  }
+
+  /** Every answer from the lead's SUBMITTED CCR interaction (none when it is a draft or absent). */
+  private async loadSubmittedCcrAnswers(leadId: string) {
+    const interaction = await this.prisma.ccrInteraction.findUnique({ where: { leadId }, include: { answers: true } })
+    return interaction?.status === 'SUBMITTED' ? interaction.answers : []
+  }
+
+  /** Structured answers from the lead's SUBMITTED CCR interaction, or null when none has been submitted. */
+  private async loadCcrDeclared(leadId: string): Promise<CcrDeclaredFacts | null> {
+    const interaction = await this.prisma.ccrInteraction.findUnique({ where: { leadId }, include: { answers: true } })
+    if (!interaction || interaction.status !== 'SUBMITTED' || !interaction.submittedAt) return null
+
+    const answered = interaction.answers.filter((a) => a.responseStatus === 'ANSWERED')
+    const amount = (fieldKey: string): number | null => answered.find((a) => a.fieldKey === fieldKey)?.answerAmount?.toNumber() ?? null
+    return {
+      monthlyIncome: amount('MONTHLY_INCOME'),
+      essentialExpenses: amount('ESSENTIAL_EXPENSES'),
+      monthlyEmi: amount('MONTHLY_EMI'),
+      canServiceEmis: answered.find((a) => a.fieldKey === 'CAN_SERVICE_EMIS')?.answerBoolean ?? null,
+      submittedAt: interaction.submittedAt.toISOString(),
     }
   }
 
@@ -415,14 +453,19 @@ export class MasterProfileService {
       return { profileAvailable: true as const, status: profile.status, errorMessage: profile.errorMessage }
     }
 
-    const [currentCreditReport, currentBankStatement] = await Promise.all([
+    const [currentCreditReport, currentBankStatement, ccrInteraction] = await Promise.all([
       this.prisma.creditReport.findUnique({ where: { leadId: lead.id } }),
       // Same COMPLETED filter as generate()'s own provenance capture — a
       // newer FAILED upload attempt must never flip this profile to "stale"
       // on its own; only a genuinely newer COMPLETED analysis should.
       this.prisma.bankStatementAnalysis.findFirst({ where: { leadId: lead.id, status: 'COMPLETED' }, orderBy: { createdAt: 'desc' } }),
+      this.prisma.ccrInteraction.findUnique({ where: { leadId: lead.id } }),
     ])
+    // A CCR interaction submitted (or reopened) after this profile was generated means the profile
+    // no longer reflects the CCR's latest answers.
+    const ccrChangedSinceGenerated = ccrInteraction?.status === 'SUBMITTED' && ccrInteraction.submittedAt !== null && profile.generatedAt !== null && ccrInteraction.submittedAt.getTime() > profile.generatedAt.getTime()
     const isStale =
+      ccrChangedSinceGenerated ||
       (currentCreditReport?.completedAt?.getTime() ?? null) !== (profile.sourceCreditReportCompletedAt?.getTime() ?? null) ||
       (currentBankStatement?.completedAt?.getTime() ?? null) !== (profile.sourceBankStatementCompletedAt?.getTime() ?? null)
 
@@ -431,13 +474,20 @@ export class MasterProfileService {
       orderBy: { createdAt: 'desc' },
       include: { result: true },
     })
-    const insights = insightsJob
+    // A job generated for an OLDER profile version must never be presented as this one's. Compared by version, not by timestamp:
+    // job.createdAt is stamped by the database clock and profile.generatedAt by the app clock, which can differ by seconds.
+    // Jobs from before the version was recorded carry no profileVersion and are treated as current.
+    const jobProfileVersion = (insightsJob?.requestPayload as { profileVersion?: unknown } | null)?.profileVersion
+    const currentInsightsJob = insightsJob && (typeof jobProfileVersion !== 'number' || jobProfileVersion === profile.version) ? insightsJob : null
+    const insights = currentInsightsJob
       ? {
-          status: insightsJob.status,
-          findings: insightsJob.result?.findings as Record<string, unknown> | undefined,
-          confidence: insightsJob.result?.confidence ?? null,
-          modelVersion: insightsJob.result?.modelVersion,
-          generatedAt: insightsJob.result?.createdAt.toISOString(),
+          // QUEUED/RUNNING past the AI timeout is reported as TIMED_OUT, never as still running.
+          status: effectiveJobStatus(currentInsightsJob),
+          errorMessage: currentInsightsJob.status === 'FAILED' ? currentInsightsJob.errorMessage : null,
+          findings: currentInsightsJob.result?.findings as Record<string, unknown> | undefined,
+          confidence: currentInsightsJob.result?.confidence ?? null,
+          modelVersion: currentInsightsJob.result?.modelVersion,
+          generatedAt: currentInsightsJob.result?.createdAt.toISOString(),
         }
       : null
 
@@ -482,7 +532,7 @@ export class MasterProfileService {
         : undefined,
       dimensionConfidences: profile.dimensionConfidences ?? undefined,
       familyNetworkVerification: profile.familyNetworkVerification ?? undefined,
-      missingInformation: profile.missingInformation.map((i) => ({ itemText: i.itemText, sourceModule: i.sourceModule, priority: i.priority, resolved: i.resolved })),
+      missingInformation: profile.missingInformation.map((i) => ({ itemText: i.itemText, sourceModule: i.sourceModule, priority: i.priority, resolved: i.resolved, resolutionSource: i.resolutionSource })),
       // Decimal -> number at this boundary, matching Debt/Financial
       // Analysis's own convention — never a raw Prisma Decimal reaching the API.
       reconciliationRows: profile.reconciliationRows.map((r) => ({

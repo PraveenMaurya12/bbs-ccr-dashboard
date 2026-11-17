@@ -5,6 +5,7 @@ import { NotAvailable, SectionCard } from '../shared/SectionCard'
 import { CohortPrimaryBadge } from './CohortBadges'
 
 /** Spec Part 23's "Secondary Flags" — every lower-precedence match preserved, never discarded. */
+// Keyed by key+label: two different conditions can map to the same cohort key (e.g. two MANUAL_REVIEW triggers).
 export function SecondaryFlagsSection({ flags }: { flags: CohortDecisionReport['secondaryFlags'] }) {
   return (
     <SectionCard icon={Flag} title="Secondary flags">
@@ -13,7 +14,7 @@ export function SecondaryFlagsSection({ flags }: { flags: CohortDecisionReport['
       ) : (
         <ul className="flex flex-col gap-2">
           {flags.map((flag) => (
-            <li key={flag.key} className="flex flex-col gap-0.5 border-b border-[#ebebeb] pb-2 last:border-0 last:pb-0">
+            <li key={`${flag.key}:${flag.label}`} className="flex flex-col gap-0.5 border-b border-[#ebebeb] pb-2 last:border-0 last:pb-0">
               <p className="text-sm font-medium text-[#171717]">{flag.label}</p>
               <p className="text-xs text-[#5c5c5c]">{flag.reason}</p>
             </li>

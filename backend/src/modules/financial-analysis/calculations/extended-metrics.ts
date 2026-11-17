@@ -599,7 +599,7 @@ export function buildExtendedRiskFlags(input: ExtendedRiskFlagInputs): Financial
 
   // --- Related-party employer (v4.0 spec §6.7/§11.7 — compliance review required) ---
   if (input.relatedPartyEmployer.detected) {
-    flags.push(flag('RELATED_PARTY_EMPLOYER', 'ATTENTION', `Income source narration matched a configured related-party/affiliate name (${input.relatedPartyEmployer.matchedName}) — compliance review required.`, { matchedName: input.relatedPartyEmployer.matchedName }))
+    flags.push(flag('RELATED_PARTY_EMPLOYER', 'ATTENTION', `Income source narration matched a configured related-party/affiliate name (${input.relatedPartyEmployer.matchedName}) — noted for information; it does not block the lead.`, { matchedName: input.relatedPartyEmployer.matchedName }))
   }
 
   // --- Unclassified transactions (v4.0 spec §13 — distinct from LOW_CLASSIFICATION_CONFIDENCE) ---

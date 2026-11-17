@@ -53,6 +53,16 @@ export function qualifiesForOptimiseOutsideC1(input: PathwayInput): boolean {
  * Engine's own persisted rule evidence).
  */
 export function resolvePathwayPrecedence(input: PathwayInput, ruleResults: PathwayRuleResultOutput[]): PathwayPrecedenceResult {
+  const result = resolveCore(input, ruleResults)
+  // Unreconciled free cash flow no longer blocks a pathway: Cohort Engine already caps the capacity band at STRESSED
+  // for it (R022), so the pathway is chosen conservatively. It is carried forward as a caveat instead.
+  if (result.pathwayStatus === 'READY' && ruleFired(ruleResults, 'P005')) {
+    return { ...result, precedenceExplanation: `${result.precedenceExplanation} Caveat: free cash flow is unreconciled, so capacity is unverified — confirm income and expenses with the customer before offering the plan.` }
+  }
+  return result
+}
+
+function resolveCore(input: PathwayInput, ruleResults: PathwayRuleResultOutput[]): PathwayPrecedenceResult {
   const { l4 } = input
 
   // Priority 1 — L4 = BLOCKED (any reason).
@@ -98,12 +108,7 @@ export function resolvePathwayPrecedence(input: PathwayInput, ruleResults: Pathw
     return { primaryPathway: null, pathwayStatus: 'INSUFFICIENT_DATA', blockingReason: 'INSUFFICIENT_DATA', inheritedBlocks: [], matchedPriority: 6, precedenceExplanation: `Priority 6: ${input.l3.p1Count} P1 item(s) outstanding.` }
   }
 
-  // Priority 7 — FCF unreconciled >30%. Genuinely reachable: Cohort Engine
-  // only CAPS the capacity band at STRESSED for this signal (R022), it
-  // never blocks L4's own primary state on it.
-  if (ruleFired(ruleResults, 'P005')) {
-    return { primaryPathway: null, pathwayStatus: 'BLOCKED', blockingReason: 'FCF_UNRECONCILED', inheritedBlocks: ['FCF_UNRECONCILED'], matchedPriority: 7, precedenceExplanation: 'Priority 7: free cash flow is unreconciled (>30% gap) — capacity unverifiable, pathway is null.' }
-  }
+  // (Priority 7 — FCF unreconciled — used to return a null pathway here. It is now a caveat on the chosen pathway; see resolvePathwayPrecedence.)
 
   // Priorities 8-13 — direct cohort -> pathway mapping, with C1/C7 disambiguation.
   switch (l4.primaryCohort) {

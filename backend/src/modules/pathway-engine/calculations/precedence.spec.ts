@@ -35,13 +35,25 @@ describe('resolvePathwayPrecedence (§7 — 14-row precedence table)', () => {
     expect(result.matchedPriority).toBe(4)
   })
 
-  it('Priority 7: FCF unreconciled >30% -> null / FCF_UNRECONCILED even when L4 assigns a real cohort', () => {
-    const input = cleanPathwayInput({ l3: { fcfReconciled: false } })
+  it('unreconciled FCF no longer blocks the pathway: the cohort\'s own pathway is kept, with a caveat', () => {
+    const input = cleanPathwayInput({ l4: { primaryState: 'C4', primaryCohort: 'C4', capacityBand: 'DISTRESSED' }, l3: { fcfReconciled: false } })
+    const result = resolvePathwayPrecedence(input, evaluateAllRulesForTest(input))
+    expect(result.primaryPathway).toBe('RESOLVE')
+    expect(result.pathwayStatus).toBe('READY')
+    expect(result.blockingReason).toBeNull()
+    expect(result.precedenceExplanation).toMatch(/Caveat: free cash flow is unreconciled/)
+  })
+
+  it('a reconciled lead gets no caveat', () => {
+    const input = cleanPathwayInput({ l4: { primaryState: 'C4', primaryCohort: 'C4', capacityBand: 'DISTRESSED' } })
+    expect(resolvePathwayPrecedence(input, evaluateAllRulesForTest(input)).precedenceExplanation).not.toMatch(/Caveat/)
+  })
+
+  it('unreconciled FCF still cannot rescue a genuinely blocked or insufficient-data lead', () => {
+    const input = cleanPathwayInput({ l4: { primaryState: 'X1', primaryCohort: 'X1' }, l3: { fcfReconciled: false } })
     const result = resolvePathwayPrecedence(input, evaluateAllRulesForTest(input))
     expect(result.primaryPathway).toBeNull()
-    expect(result.pathwayStatus).toBe('BLOCKED')
-    expect(result.blockingReason).toBe('FCF_UNRECONCILED')
-    expect(result.matchedPriority).toBe(7)
+    expect(result.pathwayStatus).toBe('INSUFFICIENT_DATA')
   })
 
   it('Priority 8: L4 = C4 -> RESOLVE', () => {

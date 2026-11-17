@@ -1,12 +1,14 @@
 import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ChevronLeft, History, PhoneCall } from 'lucide-react'
+import { ChevronLeft, History } from 'lucide-react'
 import { useBlocker, useNavigate, useParams } from 'react-router-dom'
 
 import { QueryBoundary } from '@/components/shared/QueryBoundary'
 import { ContactInfoStrip } from '../components/lead-detail/ContactInfoStrip'
 import { DebtAnalysisTab } from '../components/lead-detail/debt-analysis/DebtAnalysisTab'
 import { FinancialAnalysisTab } from '../components/lead-detail/financial-analysis/FinancialAnalysisTab'
+import { CcrInteractionTab } from '../components/lead-detail/ccr-interaction/CcrInteractionTab'
+import { DataRequirementsPanel } from '../components/lead-detail/data-requirements/DataRequirementsPanel'
 import { DocumentsTab } from '../components/lead-detail/documents/DocumentsTab'
 import { MasterProfileTab } from '../components/lead-detail/master-profile/MasterProfileTab'
 import { PathwayDecisionSection } from '../components/lead-detail/pathway-engine/PathwayDecisionSection'
@@ -116,12 +118,11 @@ export default function LeadDetailPage() {
                     onSave={(input) => updateMutation.mutateAsync(input).then(() => {})}
                   />
                 )}
-                {tab === 'call-details' && (
-                  <EmptyTabContent
-                    icon={PhoneCall}
-                    title="No call history yet"
-                    description="Call outcomes, follow-ups, and counsellor notes will appear here once this lead is contacted."
-                  />
+                {tab === 'call-details' && <CcrInteractionTab bbsLeadId={lead.bbsLeadId} />}
+                {(tab === 'final-profile' || tab === 'recovery-plan') && (
+                  <div className="mb-6">
+                    <DataRequirementsPanel bbsLeadId={lead.bbsLeadId} onOpenTab={handleTabChange} />
+                  </div>
                 )}
                 {tab === 'debt-analysis' && <DebtAnalysisTab bbsLeadId={lead.bbsLeadId} />}
                 {tab === 'financial-analysis' && <FinancialAnalysisTab bbsLeadId={lead.bbsLeadId} />}

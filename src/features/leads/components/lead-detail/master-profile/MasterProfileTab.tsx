@@ -88,7 +88,9 @@ export function MasterProfileTab({ bbsLeadId, leadName }: { bbsLeadId: string; l
     refetchInterval: (q) => {
       const data = q.state.data
       if (!data?.profileAvailable) return false
-      return data.status === 'GENERATING' ? 2000 : false
+      if (data.status === 'GENERATING') return 2000
+      // Keep refreshing while the AI synthesis is still in flight, so "running" never goes stale on screen.
+      return data.status === 'COMPLETED' && (data.insights?.status === 'QUEUED' || data.insights?.status === 'RUNNING') ? 3000 : false
     },
   })
 

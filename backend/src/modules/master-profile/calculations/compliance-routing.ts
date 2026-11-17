@@ -18,15 +18,11 @@ import type { ComplianceRoutingResult } from '../master-profile.types'
  * is the only possible non-null reason today).
  */
 export function buildComplianceRouting(relatedPartyEmployer: { detected: boolean; matchedName: string | null }, now: Date): ComplianceRoutingResult {
-  if (!relatedPartyEmployer.detected) {
-    return { complianceHold: false, reason: null, matchedEntity: null, since: null, slaHours: null, escalationHours: null }
-  }
-  return {
-    complianceHold: true,
-    reason: 'RELATED_PARTY_EMPLOYER',
-    matchedEntity: relatedPartyEmployer.matchedName,
-    since: now.toISOString(),
-    slaHours: 72,
-    escalationHours: 48,
-  }
+  // Business decision (2026-10-22): a RELATED_PARTY_EMPLOYER match is NOT a blocker. It is still detected and shown
+  // as an informational Financial Analysis flag and a CCR question, but it no longer raises a compliance hold, a P1
+  // missing-information item, or any cohort/pathway/plan block. Other compliance triggers (none are detectable in
+  // this codebase today) would be routed here.
+  void relatedPartyEmployer
+  void now
+  return { complianceHold: false, reason: null, matchedEntity: null, since: null, slaHours: null, escalationHours: null }
 }

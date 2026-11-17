@@ -96,7 +96,7 @@ describe('CohortEngineService', () => {
     consentRecord: { findMany: jest.Mock }
     cohortDecision: { findFirst: jest.Mock; create: jest.Mock; update: jest.Mock; findMany: jest.Mock }
     cohortRuleResult: { createMany: jest.Mock }
-    cohortOverride: { create: jest.Mock }
+    cohortOverride: { create: jest.Mock; count: jest.Mock }
     cohortComplianceDecision: { create: jest.Mock }
     $transaction: jest.Mock
   }
@@ -112,7 +112,7 @@ describe('CohortEngineService', () => {
       consentRecord: { findMany: jest.fn() },
       cohortDecision: { findFirst: jest.fn(), create: jest.fn(), update: jest.fn(), findMany: jest.fn() },
       cohortRuleResult: { createMany: jest.fn() },
-      cohortOverride: { create: jest.fn() },
+      cohortOverride: { create: jest.fn(), count: jest.fn().mockResolvedValue(0) },
       cohortComplianceDecision: { create: jest.fn() },
       $transaction: jest.fn().mockImplementation((ops: Array<Promise<unknown>>) => Promise.all(ops)),
     }
@@ -247,6 +247,38 @@ describe('CohortEngineService', () => {
       const result = await service.getForLead('BBS-LD-100001')
 
       expect(result).toMatchObject({ isStale: false })
+    })
+  })
+
+  describe('getForLead — a decision set by override', () => {
+    it('is never stale just because Master Profile regenerated: an override is a pinned human decision (regression: it was always stale, so Pathway refused to run and re-evaluating discarded the override)', async () => {
+      prisma.lead.findUnique.mockResolvedValue({ id: 'lead-1' })
+      prisma.cohortDecision.findFirst.mockResolvedValue({ id: 'cd-2', status: 'COMPLETED', version: 2, sourceMasterProfileVersion: 1, ruleResults: [], complianceActionsTo: [] })
+      masterProfileService.getForLead.mockResolvedValue(completedMasterProfile({ version: 5 }))
+      prisma.cohortOverride.count.mockResolvedValue(1)
+
+      expect(await service.getForLead('BBS-LD-100001')).toMatchObject({ isStale: false })
+      expect(prisma.cohortOverride.count).toHaveBeenCalledWith({ where: { newDecisionId: 'cd-2' } })
+    })
+
+    it('a rule-evaluated (non-override) decision on an older Master Profile is still stale', async () => {
+      prisma.lead.findUnique.mockResolvedValue({ id: 'lead-1' })
+      prisma.cohortDecision.findFirst.mockResolvedValue({ id: 'cd-2', status: 'COMPLETED', version: 2, sourceMasterProfileVersion: 1, ruleResults: [], complianceActionsTo: [] })
+      masterProfileService.getForLead.mockResolvedValue(completedMasterProfile({ version: 5 }))
+      prisma.cohortOverride.count.mockResolvedValue(0)
+
+      expect(await service.getForLead('BBS-LD-100001')).toMatchObject({ isStale: true })
+    })
+
+    it('the override records the Master Profile version of the decision it overrides', async () => {
+      prisma.lead.findUnique.mockResolvedValue({ id: 'lead-1' })
+      prisma.cohortDecision.findFirst.mockResolvedValue({ id: 'cd-1', version: 1, primaryCohort: 'SPECIALIST_REQUIRED', ruleVersion: 'v', secondaryFlags: null, archetype: null, pathway: null, capacityBand: null, capacityRatio: null, sustainableCashFlow: null, debtComplexityBand: null, customerExplanation: 'x', missingData: null, requiredDocuments: null, specialistReviewRequired: false, confidence: null, dataProvenance: null, consentVersion: null, sourceMasterProfileVersion: 15, sourceMasterProfileGeneratedAt: new Date('2026-10-22T13:00:00Z') })
+      prisma.cohortDecision.create.mockResolvedValue({ id: 'cd-2', version: 2 })
+      prisma.cohortOverride.create.mockResolvedValue({ id: 'ov-1' })
+
+      await service.override('BBS-LD-100001', { newPrimaryCohort: 'C1', reason: 'Specialist reviewed the case.', approverId: 'approver-1' }, { userId: 'user-1', role: 'SUPERVISOR' as never })
+
+      expect(prisma.cohortDecision.create.mock.calls[0][0].data).toMatchObject({ primaryCohort: 'C1', sourceMasterProfileVersion: 15, sourceMasterProfileGeneratedAt: new Date('2026-10-22T13:00:00Z') })
     })
   })
 

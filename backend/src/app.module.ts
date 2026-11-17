@@ -12,6 +12,7 @@ import { validate } from '@/config/env.validation'
 import { AnalysisModule } from '@/modules/analysis/analysis.module'
 import { AssessmentsModule } from '@/modules/assessments/assessments.module'
 import { AuthModule } from '@/modules/auth/auth.module'
+import { CcrInteractionModule } from '@/modules/ccr-interaction/ccr-interaction.module'
 import { CohortEngineModule } from '@/modules/cohort-engine/cohort-engine.module'
 import { CustomersModule } from '@/modules/customers/customers.module'
 import { DebtAnalysisModule } from '@/modules/debt-analysis/debt-analysis.module'
@@ -40,6 +41,7 @@ import { PublicContactModule } from '@/modules/public-contact/public-contact.mod
     FinancialAnalysisModule,
     DebtAnalysisModule,
     MasterProfileModule,
+    CcrInteractionModule,
     CohortEngineModule,
     PathwayEngineModule,
     PlanEngineModule,

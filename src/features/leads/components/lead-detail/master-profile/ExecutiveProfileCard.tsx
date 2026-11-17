@@ -20,6 +20,20 @@ const DIMENSION_LABELS: Record<MasterDimensionName, string> = {
  * limitations. The AI's own `executiveProfile` field is rendered verbatim,
  * never rephrased/hardcoded here.
  */
+function insightsStatusMessage(insights: NonNullable<MasterProfileReport['insights']>): string {
+  switch (insights.status) {
+    case 'QUEUED':
+    case 'RUNNING':
+      return 'AI synthesis is running — this updates automatically when it finishes.'
+    case 'FAILED':
+      return `AI synthesis failed${insights.errorMessage ? `: ${insights.errorMessage}` : '.'} The deterministic profile below is unaffected — regenerate the profile to retry.`
+    case 'TIMED_OUT':
+      return 'AI synthesis did not finish in time and is no longer running. The deterministic profile below is unaffected — regenerate the profile to retry.'
+    default:
+      return 'AI synthesis is unavailable.'
+  }
+}
+
 export function ExecutiveProfileCard({ profile }: { profile: MasterProfileReport }) {
   const insights = profile.insights
   const findings = insights?.status === 'COMPLETED' ? insights.findings : undefined
@@ -36,7 +50,7 @@ export function ExecutiveProfileCard({ profile }: { profile: MasterProfileReport
       </div>
       <CardDivider />
       {insights === null && <NotAvailable reason="AI synthesis has not run for this profile yet." />}
-      {insights && insights.status !== 'COMPLETED' && <NotAvailable reason={`AI synthesis is ${insights.status.toLowerCase()}.`} />}
+      {insights && insights.status !== 'COMPLETED' && <NotAvailable reason={insightsStatusMessage(insights)} />}
       {findings && <p className="text-sm leading-6 text-[#171717]">{findings.executiveProfile}</p>}
       {limitedDimensions.length > 0 && (
         <>

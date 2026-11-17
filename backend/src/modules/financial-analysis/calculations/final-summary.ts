@@ -205,7 +205,7 @@ export function buildFinalSummary(input: FinalSummaryInputs): FinalSummary {
     topFindings.push(`Income transition detected (${input.eventProfile.incomeTransition.deltaPercent}% change around ${input.eventProfile.incomeTransition.transitionMonth?.toISOString().slice(0, 7)}).`)
   }
   if (input.eventProfile.relatedPartyEmployer.detected) {
-    topFindings.push(`Related-party employer match (${input.eventProfile.relatedPartyEmployer.matchedName}) — compliance review required.`)
+    topFindings.push(`Related-party employer match (${input.eventProfile.relatedPartyEmployer.matchedName}) — noted for information; it does not block the lead.`)
   }
   if (input.eventProfile.medicalEvents.shockMonths.length > 0) {
     topFindings.push(`Medical shock identified in ${input.eventProfile.medicalEvents.shockMonths.length} month(s).`)

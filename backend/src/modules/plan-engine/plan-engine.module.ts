@@ -15,5 +15,7 @@ import { PlanEngineService } from './plan-engine.service'
   imports: [CohortEngineModule, MasterProfileModule, PathwayEngineModule, AnalysisModule],
   controllers: [PlanEngineController],
   providers: [PlanEngineService],
+  // Exported so CcrInteractionModule can refresh the plan after a CCR submit.
+  exports: [PlanEngineService],
 })
 export class PlanEngineModule {}

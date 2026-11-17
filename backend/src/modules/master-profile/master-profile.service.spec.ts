@@ -94,6 +94,7 @@ describe('MasterProfileService', () => {
     masterProfileReconciliationRow: { deleteMany: jest.Mock; createMany: jest.Mock }
     masterMissingInformationItem: { deleteMany: jest.Mock; createMany: jest.Mock }
     analysisJob: { findFirst: jest.Mock }
+    ccrInteraction: { findUnique: jest.Mock }
     $transaction: jest.Mock
   }
   let debtAnalysisService: { getForLead: jest.Mock }
@@ -111,6 +112,7 @@ describe('MasterProfileService', () => {
       masterProfileReconciliationRow: { deleteMany: jest.fn(), createMany: jest.fn() },
       masterMissingInformationItem: { deleteMany: jest.fn(), createMany: jest.fn() },
       analysisJob: { findFirst: jest.fn() },
+      ccrInteraction: { findUnique: jest.fn().mockResolvedValue(null) },
       $transaction: jest.fn().mockResolvedValue([]),
     }
     debtAnalysisService = { getForLead: jest.fn() }
@@ -163,6 +165,61 @@ describe('MasterProfileService', () => {
       expect(prisma.masterProfile.create).toHaveBeenCalledWith({ data: { leadId: 'lead-1', version: 1, status: 'GENERATING' } })
       expect(prisma.$transaction).toHaveBeenCalled()
       expect(analysisService.createAndRun).toHaveBeenCalledWith(expect.objectContaining({ bbsLeadId: 'BBS-LD-100001', jobType: 'MASTER_PROFILE_INSIGHTS' }))
+    })
+
+    describe('CCR-declared answers', () => {
+      const arrange = () => {
+        prisma.lead.findUnique.mockResolvedValue({ id: 'lead-1' })
+        debtAnalysisService.getForLead.mockResolvedValue(completedDebtAnalysis())
+        financialAnalysisService.getForLead.mockResolvedValue(completedFinancialAnalysis())
+        prisma.customer.findUnique.mockResolvedValue(null)
+        prisma.creditReport.findUnique.mockResolvedValue({ id: 'cr-1', completedAt: new Date('2026-09-01') })
+        prisma.bankStatementAnalysis.findFirst.mockResolvedValue({ id: 'bsa-1', completedAt: new Date('2026-08-31') })
+        prisma.masterProfile.findFirst.mockResolvedValue(null)
+        prisma.masterProfile.create.mockResolvedValue({ id: 'mp-1', version: 1 })
+      }
+      const submitted = (answers: Array<{ fieldKey: string; responseStatus?: string; answerAmount?: number | null; answerBoolean?: boolean | null }>) => ({
+        status: 'SUBMITTED',
+        submittedAt: new Date('2026-10-22T10:00:00Z'),
+        answers: answers.map((a) => ({ responseStatus: 'ANSWERED', answerBoolean: null, ...a, answerAmount: a.answerAmount === undefined || a.answerAmount === null ? null : { toNumber: () => a.answerAmount } })),
+      })
+      const persistedValidationRequired = () => {
+        const call = prisma.masterProfile.update.mock.calls.find(([arg]) => arg.data.status === 'COMPLETED')
+        return (call?.[0].data.validationRequired ?? []) as Array<{ item: string }>
+      }
+
+      it('surfaces a disagreement between a submitted CCR-declared figure and the observed one, and passes the declared facts to the AI synthesis', async () => {
+        arrange()
+        prisma.ccrInteraction.findUnique.mockResolvedValue(submitted([{ fieldKey: 'MONTHLY_INCOME', answerAmount: 9_000_000 }, { fieldKey: 'CAN_SERVICE_EMIS', answerBoolean: false }]))
+
+        expect((await service.generate('BBS-LD-100001')).generated).toBe(true)
+
+        const items = persistedValidationRequired().map((i) => i.item)
+        expect(items).toContain('CCR-declared income differs from bank-observed income')
+        expect(items).toContain('Customer reports difficulty servicing current EMIs')
+        const facts = analysisService.createAndRun.mock.calls[0][0].payload.masterProfileFacts
+        expect(facts.ccrDeclared).toMatchObject({ monthlyIncome: 9_000_000, canServiceEmis: false })
+      })
+
+      it('ignores a DRAFT (not yet submitted) interaction entirely', async () => {
+        arrange()
+        prisma.ccrInteraction.findUnique.mockResolvedValue({ ...submitted([{ fieldKey: 'MONTHLY_INCOME', answerAmount: 9_000_000 }]), status: 'DRAFT', submittedAt: null })
+
+        await service.generate('BBS-LD-100001')
+
+        expect(persistedValidationRequired().map((i) => i.item).some((i) => i.startsWith('CCR-declared'))).toBe(false)
+        expect(analysisService.createAndRun.mock.calls[0][0].payload.masterProfileFacts.ccrDeclared).toBeNull()
+      })
+
+      it('never counts a "not known" / "declined" response as a declared value', async () => {
+        arrange()
+        prisma.ccrInteraction.findUnique.mockResolvedValue(submitted([{ fieldKey: 'MONTHLY_INCOME', responseStatus: 'NOT_KNOWN', answerAmount: 9_000_000 }]))
+
+        await service.generate('BBS-LD-100001')
+
+        expect(persistedValidationRequired().map((i) => i.item).some((i) => i.startsWith('CCR-declared'))).toBe(false)
+        expect(analysisService.createAndRun.mock.calls[0][0].payload.masterProfileFacts.ccrDeclared.monthlyIncome).toBeNull()
+      })
     })
 
     it('appends a new version rather than overwriting a prior one', async () => {
@@ -256,6 +313,79 @@ describe('MasterProfileService', () => {
       const result = await service.getForLead('BBS-LD-100001')
 
       expect(result).toMatchObject({ isStale: true })
+    })
+
+    it('reports isStale:true when a CCR interaction was submitted after this profile was generated, and not when it was submitted before', async () => {
+      const profile = {
+        status: 'COMPLETED',
+        version: 1,
+        generatedAt: new Date('2026-10-22T10:00:00Z'),
+        sourceCreditReportCompletedAt: new Date('2026-09-01'),
+        sourceBankStatementCompletedAt: new Date('2026-08-31'),
+        reconciliationRows: [],
+        missingInformation: [],
+      }
+      prisma.lead.findUnique.mockResolvedValue({ id: 'lead-1' })
+      prisma.masterProfile.findFirst.mockResolvedValue(profile)
+      prisma.creditReport.findUnique.mockResolvedValue({ completedAt: new Date('2026-09-01') })
+      prisma.bankStatementAnalysis.findFirst.mockResolvedValue({ completedAt: new Date('2026-08-31') })
+      prisma.analysisJob.findFirst.mockResolvedValue(null)
+
+      prisma.ccrInteraction.findUnique.mockResolvedValue({ status: 'SUBMITTED', submittedAt: new Date('2026-10-22T11:00:00Z') })
+      expect(await service.getForLead('BBS-LD-100001')).toMatchObject({ isStale: true })
+
+      prisma.ccrInteraction.findUnique.mockResolvedValue({ status: 'SUBMITTED', submittedAt: new Date('2026-10-22T09:00:00Z') })
+      expect(await service.getForLead('BBS-LD-100001')).toMatchObject({ isStale: false })
+    })
+
+    describe('AI synthesis status', () => {
+      const profile = { status: 'COMPLETED', version: 4, generatedAt: new Date('2026-10-22T11:00:00Z'), sourceCreditReportCompletedAt: new Date('2026-09-01'), sourceBankStatementCompletedAt: new Date('2026-08-31'), reconciliationRows: [], missingInformation: [] }
+      const arrange = (job: Record<string, unknown> | null) => {
+        prisma.lead.findUnique.mockResolvedValue({ id: 'lead-1' })
+        prisma.masterProfile.findFirst.mockResolvedValue(profile)
+        prisma.creditReport.findUnique.mockResolvedValue({ completedAt: new Date('2026-09-01') })
+        prisma.bankStatementAnalysis.findFirst.mockResolvedValue({ completedAt: new Date('2026-08-31') })
+        prisma.analysisJob.findFirst.mockResolvedValue(job)
+      }
+      const aged = (ms: number) => new Date(Date.now() - ms)
+
+      it('reports a freshly started job as RUNNING', async () => {
+        arrange({ status: 'RUNNING', createdAt: new Date(Math.max(Date.now() - 5_000, profile.generatedAt.getTime())), startedAt: aged(4_000), result: null, errorMessage: null })
+        const r = await service.getForLead('BBS-LD-100001')
+        expect(r).toMatchObject({ insights: { status: 'RUNNING' } })
+      })
+
+      it('reports a job stuck RUNNING past the AI timeout as TIMED_OUT, not "running"', async () => {
+        arrange({ status: 'RUNNING', createdAt: aged(10 * 60_000), startedAt: aged(10 * 60_000), result: null, errorMessage: null })
+        const r = await service.getForLead('BBS-LD-100001')
+        expect(r).toMatchObject({ insights: { status: 'TIMED_OUT' } })
+      })
+
+      it("passes a FAILED job's error message through", async () => {
+        arrange({ status: 'FAILED', createdAt: aged(60_000), startedAt: aged(60_000), result: null, errorMessage: 'provider unreachable' })
+        const r = await service.getForLead('BBS-LD-100001')
+        expect(r).toMatchObject({ insights: { status: 'FAILED', errorMessage: 'provider unreachable' } })
+      })
+
+      const doneJob = (extra: Record<string, unknown>) => ({ status: 'COMPLETED', startedAt: null, result: { findings: { executiveProfile: 'X' }, confidence: 0.9, modelVersion: 'm', createdAt: new Date() }, errorMessage: null, ...extra })
+
+      it("never presents an older profile version's synthesis as this version's", async () => {
+        arrange(doneJob({ createdAt: new Date(), requestPayload: { profileVersion: 3 } }))
+        const r = await service.getForLead('BBS-LD-100001')
+        expect(r).toMatchObject({ insights: null })
+      })
+
+      it("presents this version's synthesis even when the database clock stamped it before the app clock stamped generatedAt", async () => {
+        arrange(doneJob({ createdAt: new Date(profile.generatedAt.getTime() - 5_000), requestPayload: { profileVersion: 4 } }))
+        const r = await service.getForLead('BBS-LD-100001')
+        expect(r).toMatchObject({ insights: { status: 'COMPLETED' } })
+      })
+
+      it('treats a job from before versions were recorded as current', async () => {
+        arrange(doneJob({ createdAt: new Date(), requestPayload: {} }))
+        const r = await service.getForLead('BBS-LD-100001')
+        expect(r).toMatchObject({ insights: { status: 'COMPLETED' } })
+      })
     })
 
     it('surfaces a GENERATING/FAILED profile directly rather than treating it as COMPLETED', async () => {
